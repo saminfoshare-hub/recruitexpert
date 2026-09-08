@@ -9,6 +9,8 @@ const root = document.getElementById('root');
 let currentUser = null;
 let currentEntityKey = 'dashboard';
 let searchTerm = '';
+let currentPage = 1;
+const PAGE_SIZE = 100;
 let cache = {};       // table -> rows (raw)
 let refCache = {};    // table -> {id: displayLabel} for FK dropdowns/labels
 
@@ -36,6 +38,29 @@ function fmtMoney(n) {
   return Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 function entityByKey(key) { return window.ENTITIES.find(e => e.key === key); }
+
+// Supabase/PostgREST caps select('*') at 1000 rows by default (or your
+// project's own "Max Rows" API setting, if lower). This fetches in pages,
+// advancing by however many rows actually came back — not by the requested
+// page size — so it works correctly even if a page is capped shorter than
+// requested. It only stops once a page comes back genuinely empty.
+async function fetchAllRows(table, orderCol) {
+  const pageSize = 1000;
+  let from = 0;
+  let all = [];
+  let guard = 0;
+  while (guard++ < 200) { // safety cap: 200 pages is 200k+ rows, far beyond any table here
+    let query = sb.from(table).select('*');
+    if (orderCol) query = query.order(orderCol, { ascending: false });
+    query = query.range(from, from + pageSize - 1);
+    const { data, error } = await query;
+    if (error) return { data: null, error };
+    if (!data || data.length === 0) break;
+    all = all.concat(data);
+    from += data.length;
+  }
+  return { data: all, error: null };
+}
 
 /* ---------------- AUTH ---------------- */
 async function checkSession() {
@@ -107,7 +132,7 @@ async function preloadRefCaches() {
   await Promise.all([...refTables].map(async (key) => {
     const ent = entityByKey(key);
     if (!ent) return;
-    const { data, error } = await sb.from(ent.table).select('*');
+    const { data, error } = await fetchAllRows(ent.table);
     if (error) { console.warn('preload', ent.table, error.message); return; }
     cache[ent.table] = data || [];
     refCache[ent.table] = {};
@@ -156,6 +181,7 @@ function setActiveSidebar(key) {
 async function selectEntity(key) {
   currentEntityKey = key;
   searchTerm = '';
+  currentPage = 1;
   setActiveSidebar(key);
   if (key === 'dashboard') { await showDashboard(); return; }
   const ent = entityByKey(key);
@@ -172,13 +198,17 @@ async function showDashboard() {
 
   const cards = await Promise.all(window.DASHBOARD_CARDS.map(async ([key, label, isMoney, sumField]) => {
     const ent = entityByKey(key);
-    const { data, error } = await sb.from(ent.table).select(isMoney ? sumField : ent.pk);
-    if (error) return { label, value: '—', isMoney };
     if (isMoney) {
+      // Sums need every row's amount, so page through with fetchAllRows.
+      const { data, error } = await fetchAllRows(ent.table);
+      if (error) return { label, value: '—', isMoney };
       const total = (data || []).reduce((s, r) => s + (Number(r[sumField]) || 0), 0);
       return { label, value: fmtMoney(total), isMoney };
     }
-    return { label, value: (data || []).length, isMoney };
+    // Exact row count via head request — no 1000-row cap, no row data transferred.
+    const { count, error } = await sb.from(ent.table).select(ent.pk, { count: 'exact', head: true });
+    if (error) return { label, value: '—', isMoney };
+    return { label, value: count ?? 0, isMoney };
   }));
 
   content.innerHTML = '';
@@ -204,7 +234,7 @@ async function showEntityList(ent) {
   content.innerHTML = '';
   content.appendChild(el('div', { class: 'loading-state' }, 'Loading…'));
 
-  const { data, error } = await sb.from(ent.table).select('*').order(ent.pk, { ascending: false });
+  const { data, error } = await fetchAllRows(ent.table, ent.pk);
   if (error) {
     content.innerHTML = '';
     content.appendChild(el('div', { class: 'empty-state' }, `Could not load ${ent.label}: ${error.message}`));
@@ -223,7 +253,7 @@ function renderEntityList(ent) {
 
   const searchInput = el('input', {
     type: 'text', placeholder: `Search ${ent.label.toLowerCase()}…`, value: searchTerm,
-    oninput: (e) => { searchTerm = e.target.value; renderEntityList(ent); },
+    oninput: (e) => { searchTerm = e.target.value; currentPage = 1; renderEntityList(ent); },
   });
   const toolbar = el('div', { class: 'toolbar' }, [
     el('div', { class: 'search-box' }, [el('i', { class: 'fa-solid fa-magnifying-glass' }), searchInput]),
@@ -234,26 +264,85 @@ function renderEntityList(ent) {
   ]);
   content.appendChild(toolbar);
 
+  // rows are already newest-first (fetched ordered by primary key, descending)
   const rows = filteredRows(ent);
   if (!rows.length) {
     content.appendChild(el('div', { class: 'data-card' }, el('div', { class: 'empty-state' }, `No ${ent.label.toLowerCase()} found.`)));
     return;
   }
 
-  const visibleFields = ent.fields.slice(0, 6); // keep table readable; full record shown in edit modal
+  const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  if (currentPage > totalPages) currentPage = totalPages;
+  if (currentPage < 1) currentPage = 1;
+  const pageRows = rows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+
+  const goToPage = (p) => { currentPage = p; renderEntityList(ent); };
+  content.appendChild(buildPaginationBar(rows.length, currentPage, totalPages, goToPage));
+
+  const visibleFields = ent.fields; // show every column, matching the Supabase table exactly
   const thead = el('thead', {}, el('tr', {}, [
     ...visibleFields.map(f => el('th', {}, f.label)),
     el('th', {}, 'Actions'),
   ]));
-  const tbody = el('tbody', {}, rows.map(row => el('tr', {}, [
+  const tbody = el('tbody', {}, pageRows.map(row => el('tr', {}, [
     ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name]))),
     el('td', {}, el('div', { class: 'row-actions' }, [
       el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(ent, row) }, 'Edit'),
       el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(ent, row) }, 'Delete'),
     ])),
   ])));
+  const table = el('table', { class: 'data-table' }, [thead, tbody]);
 
-  content.appendChild(el('div', { class: 'data-card' }, el('table', { class: 'data-table' }, [thead, tbody])));
+  // Two synced horizontal scrollbars: a thin one above the table (so you don't
+  // have to scroll all the way down to shift the view sideways) and the
+  // table's own scrollbar below. Dragging either one moves both together.
+  const topScrollInner = el('div', { style: 'height:1px;' });
+  const topScrollBar = el('div', { class: 'top-scrollbar', style: 'overflow-x:auto;overflow-y:hidden;margin-bottom:6px;' }, topScrollInner);
+  const tableWrap = el('div', { class: 'data-card', style: 'overflow-x:auto;' }, table);
+
+  let syncingScroll = false;
+  topScrollBar.addEventListener('scroll', () => {
+    if (syncingScroll) return;
+    syncingScroll = true; tableWrap.scrollLeft = topScrollBar.scrollLeft; syncingScroll = false;
+  });
+  tableWrap.addEventListener('scroll', () => {
+    if (syncingScroll) return;
+    syncingScroll = true; topScrollBar.scrollLeft = tableWrap.scrollLeft; syncingScroll = false;
+  });
+
+  content.appendChild(topScrollBar);
+  content.appendChild(tableWrap);
+  // Match the shim's width to the real table's rendered width once it's laid out.
+  requestAnimationFrame(() => { topScrollInner.style.width = table.scrollWidth + 'px'; });
+}
+
+// Page-number bar shown above the top scrollbar: "‹ Prev  1 2 3 … Next ›"
+function buildPaginationBar(totalRows, current, totalPages, onPageChange) {
+  const info = el('div', { class: 'page-info' }, `${totalRows} records — page ${current} of ${totalPages}`);
+  if (totalPages <= 1) return el('div', { class: 'pagination-bar' }, [info]);
+
+  const prevBtn = el('button', { class: 'btn btn-outline btn-sm', onclick: () => current > 1 && onPageChange(current - 1) }, '‹ Prev');
+  prevBtn.disabled = current === 1;
+  const nextBtn = el('button', { class: 'btn btn-outline btn-sm', onclick: () => current < totalPages && onPageChange(current + 1) }, 'Next ›');
+  nextBtn.disabled = current === totalPages;
+
+  const windowSize = 7;
+  let start = Math.max(1, current - Math.floor(windowSize / 2));
+  let end = Math.min(totalPages, start + windowSize - 1);
+  start = Math.max(1, end - windowSize + 1);
+
+  const pageBtns = [];
+  if (start > 1) { pageBtns.push(pageBtn(1, current, onPageChange)); if (start > 2) pageBtns.push(el('span', { class: 'page-ellipsis' }, '…')); }
+  for (let p = start; p <= end; p++) pageBtns.push(pageBtn(p, current, onPageChange));
+  if (end < totalPages) { if (end < totalPages - 1) pageBtns.push(el('span', { class: 'page-ellipsis' }, '…')); pageBtns.push(pageBtn(totalPages, current, onPageChange)); }
+
+  return el('div', { class: 'pagination-bar' }, [
+    info,
+    el('div', { class: 'page-btns', style: 'display:flex;gap:4px;align-items:center;flex-wrap:wrap;' }, [prevBtn, ...pageBtns, nextBtn]),
+  ]);
+}
+function pageBtn(p, current, onPageChange) {
+  return el('button', { class: `btn btn-sm ${p === current ? 'btn-primary' : 'btn-outline'}`, onclick: () => onPageChange(p) }, String(p));
 }
 
 function formatCell(field, value) {
