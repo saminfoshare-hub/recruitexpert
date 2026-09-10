@@ -1353,20 +1353,55 @@ function saveSavedReportsList(list) {
   catch (e) { toast('Could not save — your browser storage may be full (large images use a lot of space).'); return false; }
 }
 
+function exportAllReports(reports) {
+  if (!reports.length) { toast('No reports to export yet.'); return; }
+  const blob = new Blob([JSON.stringify(reports, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'recruit-expert-reports-export.json'; a.click();
+  URL.revokeObjectURL(url);
+}
+
 async function renderReportsList() {
   document.getElementById('pageTitle').textContent = 'Reports';
   const content = document.getElementById('content');
   content.innerHTML = '';
   const reports = loadSavedReports();
 
-  const toolbar = el('div', { class: 'toolbar' }, [
-    el('div', {}, 'Report designs are saved in this browser only.'),
-    el('button', { class: 'btn btn-primary', onclick: () => renderReportDesigner(null) }, [el('i', { class: 'fa-solid fa-plus' }), ' New Report']),
+  const importInput = el('input', { type: 'file', accept: '.json', style: 'display:none' });
+  importInput.addEventListener('change', () => {
+    const file = importInput.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let incoming;
+      try { incoming = JSON.parse(reader.result); }
+      catch (e) { toast('That file is not valid — expected a Reports export.'); return; }
+      if (!Array.isArray(incoming)) { toast('That file is not valid — expected a Reports export.'); return; }
+      const current = loadSavedReports();
+      // Merge by id: an imported report with an id that already exists here
+      // gets a fresh id instead of silently overwriting your local one.
+      const existingIds = new Set(current.map(r => r.id));
+      const merged = current.concat(incoming.map(r => existingIds.has(r.id) ? { ...r, id: 'rpt_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7) } : r));
+      if (saveSavedReportsList(merged)) { toast(`Imported ${incoming.length} report(s).`); renderReportsList(); }
+    };
+    reader.readAsText(file);
+    importInput.value = '';
+  });
+
+  const toolbar = el('div', { class: 'toolbar', style: 'flex-wrap:wrap;gap:10px' }, [
+    el('div', {}, 'Report designs are saved in THIS BROWSER, on THIS WEBSITE ADDRESS only — use Export/Import to move them to another site (e.g. from local testing to your live Netlify URL) or another computer/browser.'),
+    el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' }, [
+      el('button', { class: 'btn btn-outline', onclick: () => exportAllReports(reports) }, [el('i', { class: 'fa-solid fa-download' }), ' Export All']),
+      el('button', { class: 'btn btn-outline', onclick: () => importInput.click() }, [el('i', { class: 'fa-solid fa-upload' }), ' Import']),
+      importInput,
+      el('button', { class: 'btn btn-primary', onclick: () => renderReportDesigner(null) }, [el('i', { class: 'fa-solid fa-plus' }), ' New Report']),
+    ]),
   ]);
   content.appendChild(toolbar);
 
   if (!reports.length) {
-    content.appendChild(el('div', { class: 'empty-state' }, 'No saved reports yet — click "New Report" to design one.'));
+    content.appendChild(el('div', { class: 'empty-state' }, 'No saved reports yet — click "New Report" to design one, or "Import" if you have an export from another site.'));
     return;
   }
 
