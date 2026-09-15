@@ -15,9 +15,23 @@ let listFilterValue = ''; // selected value for entities with a listFilter dropd
 let listDateFrom = '';    // "dd/mm/yyyy" text — Agent/Employer Ledger date-range filter
 let listDateTo = '';
 let currentPage = 1;
+let printSelectedIds = new Set(); // checked rows for entities with ent.printReports (e.g. Employer)
 const PAGE_SIZE = 100;
 let cache = {};       // table -> rows (raw)
 let refCache = {};    // table -> {id: displayLabel} for FK dropdowns/labels
+
+// Registered once, not per-modal — checks at event time whether the Add
+// Candidate form's status line is currently in the DOM, so it doesn't need
+// cleanup when the modal closes. Fed by the (optional) KSA SmartForm Bridge
+// browser extension's content-app.js in response to the "Get Data from KSA
+// Tab" button below; does nothing if that extension isn't installed.
+document.addEventListener('re-ksa-pull-result', (e) => {
+  const msgEl = document.getElementById('re-ksa-status-msg');
+  if (!msgEl) return;
+  const detail = e.detail || {};
+  msgEl.style.color = detail.ok ? '' : 'var(--danger)';
+  msgEl.textContent = detail.message || '';
+});
 
 const SESSION_KEY = 're_session';
 function loadSavedSession() {
@@ -72,6 +86,20 @@ function formatNumber(n) {
 // ISO yyyy-mm-dd) and text fields that already look like a date. Anything it
 // doesn't confidently recognize is shown exactly as stored, rather than
 // guessed at and possibly shown wrong.
+// Prefills for a NEW record (never an existing one — editing always shows
+// what's actually stored). A field's defaultValue in entities.js is used
+// as-is, except for the special token "__TODAY__", which becomes today's
+// date in dd/mm/yyyy — the same format these text date columns are shown
+// and typed in, so it round-trips through formatDateDMY/parseStoredDate.
+function resolveDefaultValue(field) {
+  if (field.defaultValue === undefined) return '';
+  if (field.defaultValue === '__TODAY__') {
+    const d = new Date();
+    return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+  }
+  return field.defaultValue;
+}
+
 function formatDateDMY(value) {
   if (value === null || value === undefined || value === '') return '—';
   const s = String(value).trim();
@@ -130,6 +158,54 @@ async function fetchAllRows(table, orderCol, agencyField) {
     let query = sb.from(table).select('*');
     if (agencyField && currentAgencyId != null) query = query.eq(agencyField, currentAgencyId);
     if (orderCol) query = query.order(orderCol, { ascending: false });
+    query = query.range(from, from + pageSize - 1);
+    const { data, error } = await query;
+    if (error) return { data: null, error };
+    if (!data || data.length === 0) break;
+    all = all.concat(data);
+    from += data.length;
+  }
+  return { data: all, error: null };
+}
+
+// The logged-in agency's own COMPANY record — already sitting in cache
+// (preloadRefCaches fetches it, scoped to currentAgencyId, at every boot),
+// so this never needs its own network call. Used for autofilled
+// Agency/Owner/License fields, and below for per-agency report letterheads.
+function currentAgencyRow() {
+  const companyEnt = entityByKey('company');
+  return (cache[companyEnt.table] || []).find(c => String(c[companyEnt.pk]) === String(currentAgencyId)) || null;
+}
+
+// CATEGORY.AgencyID is its own column, separate from EMPLOYER.AGENCYID, and
+// on older/imported rows it's sometimes never been filled in — even though
+// the category's EMPID clearly points at an employer that does belong to
+// this agency. Filtering on CATEGORY.AgencyID alone was quietly hiding
+// those rows, so the Categories list showed fewer records than Employers.
+// This instead fetches employers for the current agency first, then pulls
+// in any category matching EITHER its own AgencyID OR an EMPID in that
+// employer list — same paging approach as fetchAllRows, just with an
+// .or() filter instead of a plain .eq().
+async function fetchAllRowsForCategory(ent) {
+  if (currentAgencyId == null) return fetchAllRows(ent.table, ent.pk, null);
+  const employerEnt = entityByKey('employer');
+  let employerIds = [];
+  if (employerEnt) {
+    const { data: empData, error: empErr } = await fetchAllRows(employerEnt.table, null, employerEnt.agencyField);
+    if (empErr) return { data: null, error: empErr };
+    employerIds = (empData || []).map(r => r[employerEnt.pk]).filter(id => id != null);
+  }
+  // '-1' is a harmless placeholder EMPID that will never match a real row,
+  // used only so the .in.() clause is never left syntactically empty.
+  const idList = employerIds.length ? employerIds.join(',') : '-1';
+  const orFilter = `AgencyID.eq.${currentAgencyId},EMPID.in.(${idList})`;
+  const pageSize = 1000;
+  let from = 0;
+  let all = [];
+  let guard = 0;
+  while (guard++ < 200) {
+    let query = sb.from(ent.table).select('*').or(orFilter);
+    if (ent.pk) query = query.order(ent.pk, { ascending: false });
     query = query.range(from, from + pageSize - 1);
     const { data, error } = await query;
     if (error) return { data: null, error };
@@ -259,7 +335,9 @@ async function preloadRefCaches() {
   await Promise.all([...refTables].map(async (key) => {
     const ent = entityByKey(key);
     if (!ent) return;
-    const { data, error } = await fetchAllRows(ent.table, null, ent.agencyField);
+    const { data, error } = key === 'category'
+      ? await fetchAllRowsForCategory(ent)
+      : await fetchAllRows(ent.table, null, ent.agencyField);
     if (error) { console.warn('preload', ent.table, error.message); return; }
     cache[ent.table] = data || [];
     refCache[ent.table] = {};
@@ -321,6 +399,7 @@ async function selectEntity(key) {
   listDateFrom = '';
   listDateTo = '';
   currentPage = 1;
+  printSelectedIds = new Set();
   setActiveSidebar(key);
   if (key === 'dashboard') { await showDashboard(); return; }
   if (key === 'searchform') { await renderSearchForm(); return; }
@@ -377,7 +456,9 @@ async function showEntityList(ent) {
   content.innerHTML = '';
   content.appendChild(el('div', { class: 'loading-state' }, 'Loading…'));
 
-  const { data, error } = await fetchAllRows(ent.table, ent.pk, ent.agencyField);
+  const { data, error } = ent.key === 'category'
+    ? await fetchAllRowsForCategory(ent)
+    : await fetchAllRows(ent.table, ent.pk, ent.agencyField);
   if (error) {
     content.innerHTML = '';
     content.appendChild(el('div', { class: 'empty-state' }, `Could not load ${ent.label}: ${error.message}`));
@@ -392,10 +473,9 @@ async function showEntityList(ent) {
 
 /* ---------------- SEARCH CANDIDATES (combinable filters over DATATABLE) ----------------
    Filters are AND-combined and live: changing Agent, Employer, Status, or
-   either date box immediately re-filters the results below — no submit
-   button. Date range filters on TRAVELDATE by default (the field most
-   recruitment searches care about); tell me if you meant a different
-   DATATABLE date column and I'll repoint it. */
+   any date box immediately re-filters the results below — no submit
+   button. Two independent date ranges are offered: Travel Date and FSA
+   Date (FSADate). */
 async function renderSearchForm() {
   document.getElementById('pageTitle').textContent = 'Search Candidates';
   const content = document.getElementById('content');
@@ -422,9 +502,16 @@ async function renderSearchForm() {
     el('option', { value: '' }, '— Any Agent —'),
     ...(cache[agentEnt.table] || []).map(r => el('option', { value: r[agentEnt.pk] }, r[agentEnt.displayField] ?? `#${r[agentEnt.pk]}`)),
   ]);
+  // Only "real" employers (ACTIVE = True) show up here — this is also what
+  // hides test/junk rows like a stray "this is my first entry" employer:
+  // it was never marked Active, so it simply won't be offered as an option
+  // to pick anymore, rather than being pickable but always returning zero
+  // matching candidates.
+  const activeEmployers = (cache[employerEnt.table] || [])
+    .filter(r => String(r.ACTIVE ?? '').trim().toLowerCase() === 'true');
   const employerSelect = el('select', {}, [
     el('option', { value: '' }, '— Any Employer —'),
-    ...(cache[employerEnt.table] || []).map(r => el('option', { value: r[employerEnt.pk] }, r[employerEnt.displayField] ?? `#${r[employerEnt.pk]}`)),
+    ...activeEmployers.map(r => el('option', { value: r[employerEnt.pk] }, r[employerEnt.displayField] ?? `#${r[employerEnt.pk]}`)),
   ]);
   const statusSelect = el('select', {}, [
     el('option', { value: '' }, '— Any Status —'),
@@ -432,6 +519,47 @@ async function renderSearchForm() {
   ]);
   const dateFromInp = el('input', { type: 'text', placeholder: 'dd/mm/yyyy' });
   const dateToInp = el('input', { type: 'text', placeholder: 'dd/mm/yyyy' });
+  const fsaDateFromInp = el('input', { type: 'text', placeholder: 'dd/mm/yyyy' });
+  const fsaDateToInp = el('input', { type: 'text', placeholder: 'dd/mm/yyyy' });
+
+  // Checkbox selection, tracked by DID, so it survives filter/page changes —
+  // select some candidates, adjust a filter, they're still selected.
+  const selectedIds = new Set();
+
+  // Report buttons, grouped in display order as requested (Karachi group,
+  // then the second group, then anything else) but rendered as ONE row so
+  // they sit side by side with no visual gap between the groups. Demand
+  // Letter, Permission Exp, Permission Letter, and Undertaking Permission
+  // moved to the Categories list instead (those are per-category documents,
+  // not per-candidate) — see buildPrintReportsSection() and the 'category'
+  // entity's printReports list.
+  const ROW1_NAMES = ['visa form karachi', 'visa form isb', 'isb undertaking', 'isb barcodes'];
+  const ROW2_NAMES = ['insurance form g', 'bc', 'fsa letter', 'fsa', 'nbp', 'service card'];
+  const MOVED_TO_CATEGORY = ['demand letter', 'permission exp', 'permission letter', 'undertaking permission', 'exp trade'];
+  const savedReports = loadSavedReports().filter(r => !MOVED_TO_CATEGORY.includes(r.name.trim().toLowerCase()));
+  const getSelectedCandidates = () => (cache[dtEnt.table] || []).filter(row => selectedIds.has(row[dtEnt.pk]));
+  const row1Reports = savedReports.filter(r => ROW1_NAMES.includes(r.name.trim().toLowerCase()));
+  const row2Reports = savedReports.filter(r => ROW2_NAMES.includes(r.name.trim().toLowerCase()));
+  const otherReports = savedReports.filter(r => !ROW1_NAMES.includes(r.name.trim().toLowerCase()) && !ROW2_NAMES.includes(r.name.trim().toLowerCase()));
+
+  content.appendChild(buildReportButtonsRow([...row1Reports, ...row2Reports, ...otherReports], getSelectedCandidates));
+  if (!savedReports.length) {
+    content.appendChild(el('div', { class: 'toolbar' }, el('div', { class: 'empty-state', style: 'padding:8px 0;' }, 'No saved reports yet — build one in Reports first.')));
+  }
+
+  // "Selected" narrows the results to just the ticked rows; "Show All" drops
+  // that narrowing again. It sits on TOP of the normal filters rather than
+  // replacing them, and selectedIds is keyed by DID, so ticking rows, hitting
+  // Selected, then changing a filter all behave sensibly together.
+  let showOnlySelected = false;
+  const selectedOnlyBtn = el('button', {
+    class: 'btn btn-outline',
+    onclick: () => { showOnlySelected = true; searchPage = 1; renderSearchResults(); },
+  }, 'Selected');
+  const showAllBtn = el('button', {
+    class: 'btn btn-primary',
+    onclick: () => { showOnlySelected = false; searchPage = 1; renderSearchResults(); },
+  }, 'Show All');
 
   const filterBar = el('div', { class: 'toolbar', style: 'flex-wrap:wrap;gap:16px;align-items:flex-end;' }, [
     el('div', { class: 'f-field' }, [el('label', {}, 'Agent'), agentSelect]),
@@ -439,6 +567,12 @@ async function renderSearchForm() {
     el('div', { class: 'f-field' }, [el('label', {}, 'Status'), statusSelect]),
     el('div', { class: 'f-field' }, [el('label', {}, 'Travel Date From'), dateFromInp]),
     el('div', { class: 'f-field' }, [el('label', {}, 'Travel Date To'), dateToInp]),
+    el('div', { class: 'f-field' }, [el('label', {}, 'FSA Date From'), fsaDateFromInp]),
+    el('div', { class: 'f-field' }, [el('label', {}, 'FSA Date To'), fsaDateToInp]),
+    el('div', { class: 'f-field' }, [
+      el('label', {}, 'Ticked rows'),
+      el('div', { style: 'display:flex;gap:8px;' }, [selectedOnlyBtn, showAllBtn]),
+    ]),
   ]);
   content.appendChild(filterBar);
 
@@ -447,6 +581,7 @@ async function renderSearchForm() {
 
   let searchPage = 1;
   function matchesFilters(row) {
+    if (showOnlySelected && !selectedIds.has(row[dtEnt.pk])) return false;
     if (agentSelect.value && String(row.COID ?? '') !== String(agentSelect.value)) return false;
     if (employerSelect.value && String(row.EMPID ?? '') !== String(employerSelect.value)) return false;
     if (statusSelect.value && String(row.STATUS ?? '') !== String(statusSelect.value)) return false;
@@ -458,15 +593,35 @@ async function renderSearchForm() {
       if (from && rowDate < from) return false;
       if (to && rowDate > to) return false;
     }
+    const fsaFrom = parseInputDMY(fsaDateFromInp.value);
+    const fsaTo = parseInputDMY(fsaDateToInp.value);
+    if (fsaFrom || fsaTo) {
+      const fsaRowDate = parseStoredDate(row.FSADate);
+      if (!fsaRowDate) return false; // can't confirm it falls in range, so don't guess
+      if (fsaFrom && fsaRowDate < fsaFrom) return false;
+      if (fsaTo && fsaRowDate > fsaTo) return false;
+    }
     return true;
   }
 
   function renderSearchResults() {
     const body = document.getElementById('searchResultsBody');
     body.innerHTML = '';
-    const rows = (cache[dtEnt.table] || []).filter(matchesFilters);
+    // Keep the two buttons honest: live count, and whichever mode is active
+    // is the highlighted one.
+    selectedOnlyBtn.textContent = `Selected (${selectedIds.size})`;
+    selectedOnlyBtn.className = showOnlySelected ? 'btn btn-primary' : 'btn btn-outline';
+    showAllBtn.className = showOnlySelected ? 'btn btn-outline' : 'btn btn-primary';
+    let rows = (cache[dtEnt.table] || []).filter(matchesFilters);
+    // Match Supabase's own Table Editor order exactly: ascending by DID.
+    rows = [...rows].sort((a, b) => (a.DID ?? 0) - (b.DID ?? 0));
     if (!rows.length) {
-      body.appendChild(el('div', { class: 'data-card' }, el('div', { class: 'empty-state' }, 'No matching candidates.')));
+      const msg = showOnlySelected && selectedIds.size === 0
+        ? 'No rows are ticked yet — tick some rows, or press "Show All".'
+        : (showOnlySelected
+            ? 'None of the ticked rows match the current filters — press "Show All" to see everything.'
+            : 'No matching candidates.');
+      body.appendChild(el('div', { class: 'data-card' }, el('div', { class: 'empty-state' }, msg)));
       return;
     }
     const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
@@ -478,17 +633,41 @@ async function renderSearchForm() {
     body.appendChild(buildPaginationBar(rows.length, searchPage, totalPages, goToPage));
 
     const visibleFields = dtEnt.fields;
+    const selectAllBox = el('input', { type: 'checkbox' });
+    selectAllBox.checked = pageRows.length > 0 && pageRows.every(row => selectedIds.has(row[dtEnt.pk]));
+    selectAllBox.addEventListener('change', () => {
+      pageRows.forEach(row => {
+        if (selectAllBox.checked) selectedIds.add(row[dtEnt.pk]);
+        else selectedIds.delete(row[dtEnt.pk]);
+      });
+      renderSearchResults();
+    });
     const thead = el('thead', {}, el('tr', {}, [
+      el('th', {}, selectAllBox),
       ...visibleFields.map(f => el('th', {}, f.label)),
       el('th', {}, 'Actions'),
     ]));
-    const tbody = el('tbody', {}, pageRows.map(row => el('tr', {}, [
-      ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name]))),
-      el('td', {}, el('div', { class: 'row-actions' }, [
-        el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(dtEnt, row) }, 'Edit'),
-        el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(dtEnt, row) }, 'Delete'),
-      ])),
-    ])));
+    const tbody = el('tbody', {}, pageRows.map(row => {
+      const rowCheckbox = el('input', { type: 'checkbox' });
+      rowCheckbox.checked = selectedIds.has(row[dtEnt.pk]);
+      rowCheckbox.addEventListener('change', () => {
+        if (rowCheckbox.checked) selectedIds.add(row[dtEnt.pk]);
+        else selectedIds.delete(row[dtEnt.pk]);
+        selectAllBox.checked = pageRows.every(r => selectedIds.has(r[dtEnt.pk]));
+        // Live count, without re-rendering the whole table — re-rendering on
+        // every tick would yank rows out from under the cursor while in
+        // Selected mode.
+        selectedOnlyBtn.textContent = `Selected (${selectedIds.size})`;
+      });
+      return el('tr', {}, [
+        el('td', {}, rowCheckbox),
+        ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name]))),
+        el('td', {}, el('div', { class: 'row-actions' }, [
+          el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(dtEnt, row) }, 'Edit'),
+          el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(dtEnt, row) }, 'Delete'),
+        ])),
+      ]);
+    }));
     const table = el('table', { class: 'data-table' }, [thead, tbody]);
 
     const topScrollInner = el('div', { style: 'height:1px;' });
@@ -505,7 +684,7 @@ async function renderSearchForm() {
 
   const runSearch = () => { searchPage = 1; renderSearchResults(); };
   [agentSelect, employerSelect, statusSelect].forEach(inp => inp.addEventListener('change', runSearch));
-  [dateFromInp, dateToInp].forEach(inp => inp.addEventListener('input', runSearch));
+  [dateFromInp, dateToInp, fsaDateFromInp, fsaDateToInp].forEach(inp => inp.addEventListener('input', runSearch));
 
   renderSearchResults();
 }
@@ -569,16 +748,83 @@ function renderEntityList(ent) {
         ]
       : []),
     ...(ent.key === 'datatable'
-      ? [el('button', { class: 'btn btn-outline', onclick: () => openVisaFormKhi() }, [el('i', { class: 'fa-solid fa-print' }), ' Visa Form KHI'])]
+      ? [
+          el('button', { class: 'btn btn-outline', onclick: () => openVisaFormKhi() }, [el('i', { class: 'fa-solid fa-print' }), ' Visa Form KHI']),
+          el('button', { class: 'btn btn-outline', onclick: () => openVisaFormIsb() }, [el('i', { class: 'fa-solid fa-print' }), ' Visa Form ISB']),
+        ]
       : []),
     el('button', { class: 'btn btn-outline', onclick: () => exportCsv(ent) }, [el('i', { class: 'fa-solid fa-download' }), ' Export Report (CSV)']),
     el('button', { class: 'btn btn-primary', onclick: () => openForm(ent, null) }, [el('i', { class: 'fa-solid fa-plus' }), ` Add ${ent.label.replace(/s$/, '')}`]),
   ]);
-  const toolbar = el('div', { class: 'toolbar', style: 'display:flex;flex-direction:column;align-items:stretch;gap:12px;' }, [
+  // Search row sits flush against the button row below it — no vertical
+  // gap between them (was gap:12px).
+  const hasPrintReports = !!(ent.printReports && ent.printReports.length);
+  const toolbar = el('div', {
+    class: 'toolbar',
+    // When this entity also gets the Category-style print-buttons row right
+    // underneath (see below), drop the toolbar's own bottom margin too —
+    // otherwise the shared .toolbar class's margin-bottom:16px leaves a gap
+    // above that row even though the row itself is already flush (margin:0
+    // in buildReportButtonsRow).
+    style: `display:flex;flex-direction:column;align-items:stretch;gap:0;${hasPrintReports ? 'margin-bottom:0;' : ''}`,
+  }, [
     searchControl,
     buttonRow,
   ]);
   content.appendChild(toolbar);
+
+  // Entities with ent.printReports (currently just Categories) get a row of
+  // print buttons above the list — check the rows you want with the extra
+  // checkbox column (added in refreshEntityListBody below), then click a
+  // report to print it for whichever rows are checked.
+  if (ent.printReports && ent.printReports.length) {
+    const matching = loadSavedReports().filter(r => ent.printReports.map(n => n.toLowerCase()).includes(r.name.trim().toLowerCase()));
+    const getSelected = () => {
+      const rows = (cache[ent.table] || []).filter(row => printSelectedIds.has(row[ent.pk]));
+      if (ent.key !== 'category') return rows;
+      // Group the checked categories by employer. Some reports (e.g. Demand
+      // Letter) were built using the newer "EMPLOYER.NAMEOFEMPLOYER"-style
+      // prefixed fields, which resolveFieldValue() can resolve straight off
+      // a bare category row (it has EMPID/CATEGORYID right on it) — but
+      // older reports (Permission Exp, Permission Letter, Undertaking
+      // Permission) were built with the employer's field names used
+      // directly (just "NAMEOFEMPLOYER", no prefix), which only resolves
+      // if that field actually exists on the row being printed. So the
+      // linked Employer's fields are flattened onto the row here too,
+      // covering both conventions at once — that's what was missing for
+      // every button except Demand Letter.
+      //
+      // An employer with MORE than one checked category becomes one
+      // stand-in "candidate" with CATEGORYID: '__ALL__' — buildCandidatePage's
+      // repeating-row logic sees that and lists every category in
+      // __categoryRows__ on a single page (stacked downward from where
+      // each CATEGORY.* field was placed in the designer), rather than
+      // printing one page per category.
+      const employerEnt = entityByKey('employer');
+      const empRowFor = (empId) => (empId != null && empId !== '')
+        ? (cache[employerEnt.table] || []).find(e => String(e[employerEnt.pk]) === String(empId))
+        : null;
+      const byEmployer = new Map();
+      rows.forEach(catRow => {
+        const key = (catRow.EMPID != null && catRow.EMPID !== '') ? String(catRow.EMPID) : `__none__${catRow[ent.pk]}`;
+        if (!byEmployer.has(key)) byEmployer.set(key, []);
+        byEmployer.get(key).push(catRow);
+      });
+      const grouped = [...byEmployer.values()].map(catRows => {
+        if (catRows.length === 1) {
+          const empRow = empRowFor(catRows[0].EMPID);
+          return empRow ? { ...empRow, ...catRows[0] } : catRows[0];
+        }
+        const sorted = catRows.slice().sort((a, b) => String(a.CATEGORY ?? '').localeCompare(String(b.CATEGORY ?? '')));
+        const empRow = empRowFor(sorted[0].EMPID);
+        return { ...(empRow || {}), EMPID: sorted[0].EMPID, CATEGORYID: '__ALL__', __categoryRows__: sorted };
+      });
+      // Sort the resulting pages by employer so, with several employers
+      // checked at once, their pages still come out grouped together.
+      return grouped.sort((a, b) => String(a.EMPID ?? '').localeCompare(String(b.EMPID ?? ''), undefined, { numeric: true }));
+    };
+    if (matching.length) content.appendChild(buildReportButtonsRow(matching, getSelected));
+  }
 
   const listBody = el('div', { id: 'entityListBody' }, []);
   content.appendChild(listBody);
@@ -609,18 +855,50 @@ function refreshEntityListBody(ent) {
   const goToPage = (p) => { currentPage = p; refreshEntityListBody(ent); };
   listBody.appendChild(buildPaginationBar(rows.length, currentPage, totalPages, goToPage));
 
-  const visibleFields = ent.fields; // show every column, matching the Supabase table exactly
+  const visibleFields = ent.key === 'datatable'
+    // Ordered by the whitelist itself, not by the order fields happen to sit
+    // in entities.js. A name in the list that no longer exists as a field is
+    // skipped rather than rendering a blank column.
+    ? DATATABLE_LIST_FIELDS.map(name => ent.fields.find(f => f.name === name)).filter(Boolean)
+    : ent.fields; // show every column, matching the Supabase table exactly
+  const hasPrintReports = !!(ent.printReports && ent.printReports.length);
+  let selectAllBox = null;
+  if (hasPrintReports) {
+    selectAllBox = el('input', { type: 'checkbox' });
+    selectAllBox.checked = pageRows.length > 0 && pageRows.every(row => printSelectedIds.has(row[ent.pk]));
+    selectAllBox.addEventListener('change', () => {
+      pageRows.forEach(row => {
+        if (selectAllBox.checked) printSelectedIds.add(row[ent.pk]);
+        else printSelectedIds.delete(row[ent.pk]);
+      });
+      refreshEntityListBody(ent);
+    });
+  }
   const thead = el('thead', {}, el('tr', {}, [
+    ...(hasPrintReports ? [el('th', {}, selectAllBox)] : []),
     ...visibleFields.map(f => el('th', {}, f.label)),
     el('th', {}, 'Actions'),
   ]));
-  const tbody = el('tbody', {}, pageRows.map(row => el('tr', {}, [
-    ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name]))),
-    el('td', {}, el('div', { class: 'row-actions' }, [
-      el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(ent, row) }, 'Edit'),
-      el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(ent, row) }, 'Delete'),
-    ])),
-  ])));
+  const tbody = el('tbody', {}, pageRows.map(row => {
+    let rowCheckbox = null;
+    if (hasPrintReports) {
+      rowCheckbox = el('input', { type: 'checkbox' });
+      rowCheckbox.checked = printSelectedIds.has(row[ent.pk]);
+      rowCheckbox.addEventListener('change', () => {
+        if (rowCheckbox.checked) printSelectedIds.add(row[ent.pk]);
+        else printSelectedIds.delete(row[ent.pk]);
+        if (selectAllBox) selectAllBox.checked = pageRows.every(r => printSelectedIds.has(r[ent.pk]));
+      });
+    }
+    return el('tr', {}, [
+      ...(hasPrintReports ? [el('td', {}, rowCheckbox)] : []),
+      ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name]))),
+      el('td', {}, el('div', { class: 'row-actions' }, [
+        el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(ent, row) }, 'Edit'),
+        el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(ent, row) }, 'Delete'),
+      ])),
+    ]);
+  }));
   const table = el('table', { class: 'data-table' }, [thead, tbody]);
 
   // Two synced horizontal scrollbars: a thin one above the table (so you don't
@@ -690,12 +968,17 @@ function formatCell(field, value) {
 
 function filteredRows(ent) {
   let rows = cache[ent.table] || [];
-  // Candidates: show most recently added first (DID is the auto-incrementing
-  // primary key, so the highest value is the newest record).
-  if (ent.key === 'datatable') rows = [...rows].sort((a, b) => (b.DID ?? 0) - (a.DID ?? 0));
-  // Categories tied to a now-inactive employer are hidden from the list —
-  // same rule as the dropdowns, so the list and the pickers stay consistent.
-  if (ent.key === 'category') rows = rows.filter(isCategoryEmployerActive);
+  // Match Supabase's own Table Editor order exactly: ascending by DID.
+  if (ent.key === 'datatable') rows = [...rows].sort((a, b) => (a.DID ?? 0) - (b.DID ?? 0));
+  // NOTE: categories linked to an inactive employer used to be hidden here
+  // too ("same rule as the dropdowns") — but that was quietly cutting the
+  // Category list down to a fraction of what's actually in the table (28
+  // shown, in one case, because most employers on file are marked
+  // inactive). The list should show everything for the agency regardless
+  // of the linked employer's active flag; dropdown pickers (openForm's FK
+  // selects) still apply isCategoryEmployerActive on their own, since
+  // steering new records away from an inactive employer is a different
+  // concern from hiding records you're trying to view, manage, or print.
   // Picklist filter (e.g. Agent Ledger by Agent, Employer Ledger by Company)
   if (ent.listFilter && listFilterValue) {
     rows = rows.filter(row => String(row[ent.listFilter.field]) === listFilterValue);
@@ -785,26 +1068,122 @@ const CUSTOM_OPTION_LABELS = {
 // All of these are derived, never hand-typed, so the form disables them.
 const DATATABLE_CATEGORY_AUTOFILL = {
   CATEGORY: 'CATEGORY', SALARY: 'SALARY', QUANTITY: 'QUANTITY', REQTRADE: 'REQTRADE',
+  ARBICTRADE: 'CATEGORYARBIC',
 };
 const DATATABLE_EMPLOYER_AUTOFILL = {
   NAMEOFEMPLOYER: 'NAMEOFEMPLOYER', ADDRESSOFEMPLOYER: 'ADDRESSOFEMPLOYER', VISANO: 'VISANO',
   IDNO: 'IDNO', VISADATE: 'VISADATE', DEMAND: 'DEMAND', CITY: 'CITY', VISATYPE: 'VISATYPE',
-  FileNo: 'FILENO', Embassyin: 'EMBASSYIN',
+  FileNo: 'FILENO', Embassyin: 'EMBASSYIN', ARBICCOMPANY: 'ARBICCOMPANY',
 };
 const DATATABLE_AGENCY_AUTOFILL = {
   NAMEOFEGENCY: 'AGENCYNAME', NAMEOFOWNER: 'NAMEOFOWNER', LICNO: 'LICENCENUMBER',
 };
 
+// Same idea, for EMPLOYER's own Name of Agency / Name of Owner / License No
+// fields — always the logged-in agency's own COMPANY record. Keys here are
+// EMPLOYER's actual DB column names, which came out lowercase (and "license
+// no" with a literal space) since they were added via the table editor
+// without quoting — not the same casing as DATATABLE's equivalent columns.
+const EMPLOYER_AGENCY_AUTOFILL = {
+  nameofagency: 'AGENCYNAME', nameofowner: 'NAMEOFOWNER', 'license no': 'LICENCENUMBER',
+};
+
+// Fields left out of the DATATABLE Add/Edit form entirely (not needed there)
+// — still normal DB columns, so nothing else about them changes.
+const DATATABLE_FORM_HIDDEN_FIELDS = [
+  'NAMEOFOWNER', 'NAMEOFEGENCY', 'LICNO', 'LICENSE NO', 'EMPID',
+  'ENDORSED', 'SUBMIT', 'V Barcode', 'E Barcode', 'Open',
+  'MEDICALNAME', 'AUTHORIZATION', 'GMCA', 'Photo',
+];
+
+// The opposite direction: fields hidden from the Candidates LIST/grid view
+// only — still fully shown and editable in the Add/Edit form. Add field
+// names here to declutter the list table without losing access to the data.
+// Which columns the DATATABLE list (the "front table") shows, in this exact
+// order. This is a whitelist — anything not named here simply isn't shown as
+// a column. It affects the LIST ONLY: the Add/Edit form still shows every
+// field, laid out by DATATABLE_FORM_SECTIONS below.
+const DATATABLE_LIST_FIELDS = [
+  'COID',
+  'NAMEOFEMPLOYER',
+  'NAME',
+  'FATHERSNAME',
+  'PASSPORTNO',
+  'VISANO',
+  'Enumber',
+  'CATEGORY',
+  'STATUS',
+  'VISASTAMPED',
+  'TRAVELDATE',
+  'Embassyin',
+  'Mobile',
+  'SALARY',
+  'DATE',
+  'FSANo',
+  'FSADate',
+  'REMARKS',
+];
+
+// DATATABLE's Add/Edit form has 70+ fields — grouped into named sections
+// (in this order) so it reads as a form instead of a wall of boxes. Any
+// field not listed in any group below (and not in the hidden list above)
+// still shows up, in a final "Other Details" section, so nothing from
+// entities.js is ever silently dropped.
+const DATATABLE_FORM_SECTIONS = [
+  {
+    title: 'Agent, Name & Employer Details',
+    fields: [
+     'AGENCYID', 'DATE', 'COID', 'CATEGORYID', 'NAMEOFEMPLOYER','ARBICCOMPANY', 'ARBICTRADE',
+         'CATEGORY', 
+      'ADDRESSOFEMPLOYER', 'VISANO', 'IDNO', 'VISADATE', 'DEMAND', 'CITY',
+      'VISATYPE', 'FileNo', 'Embassyin', 'SALARY', 'QUANTITY', 'REQTRADE',
+      'CONTRACT', 'PERMISSIONNO', 'DATED',
+    ],
+  },
+  {
+    title: 'Candidate Details',
+    fields: [
+      'NAME', 'FATHERSNAME', 'PASSPORTNO', 'DATEOFBIRTH', 'PLACEOFBIRTH',
+      'DATEOFISSUE', 'DATEOFEXPIRY', 'ADDRESS', 'COUNTRY', 'DISTRICT',
+      'Enumber', 'SEX', 'MERITALSTATUS', 'RELIGION',
+      'NIC', 'PLACEOFISSUE', 'Qualification',
+      'ARBICNAME', 'ARBICFATHERNAME', 'Select',
+      'SECT', 'NICISSUEDATE', 'STICKERNO', 'Mobile',
+    ],
+  },
+  {
+    title: 'Status & Travel',
+    fields: [
+      'STATUS', 'VISASTAMPED', 'FSANo', 'FSADate', 'TRAVELDATE',
+      'PURPOSE', 'TRAVELBY', 'FLIGHT', 'DESTINATION', 'Ticket No',
+    ],
+  },
+  {
+    title: 'Insurance Person Details',
+    fields: ['NAMEOFINSURANCE', 'AGEOFINSURANCE', 'RELATIONOFINSURANCE', 'ADDRESSOFINSURANCE', 'NICOFINSURANCE'],
+  },
+];
+
 async function openForm(ent, existingRow) {
   // make sure dropdown ref data is fresh
   await preloadRefCaches();
 
-  const overlay = el('div', { class: 'modal-overlay', onclick: (e) => { if (e.target === overlay) overlay.remove(); } });
+  const overlay = el('div', {
+    class: 'modal-overlay',
+    onclick: (e) => {
+      // DATATABLE's form is long, with a lot to type in — an accidental
+      // click on the dimmed background shouldn't lose it. It only closes via
+      // the ✕ / Cancel buttons or after a successful Save. Other, shorter
+      // forms keep the old click-outside-to-close behavior.
+      if (e.target === overlay && ent.key !== 'datatable') overlay.remove();
+    },
+  });
   const inputs = {};
+  const fieldNodesByName = {};
 
   const fieldNodes = ent.fields.map(f => {
     let inputEl;
-    const val = existingRow ? existingRow[f.name] : '';
+    const val = existingRow ? existingRow[f.name] : resolveDefaultValue(f);
     const isAgencyField = ent.agencyField && f.name === ent.agencyField;
     if (f.type === 'textarea') {
       inputEl = el('textarea', {}, '');
@@ -841,19 +1220,55 @@ async function openForm(ent, existingRow) {
       inputEl.value = val ?? '';
     }
     inputs[f.name] = inputEl;
+    // Stable hook so outside tooling (e.g. the optional KSA SmartForm bridge
+    // extension) can find specific fields reliably — the field's own JS
+    // object key isn't visible in the DOM otherwise.
+    inputEl.setAttribute('data-field', f.name);
     const wrapClass = (f.type === 'textarea') ? 'f-field full' : 'f-field';
-    return el('div', { class: wrapClass }, [
+    const node = el('div', { class: wrapClass }, [
       el('label', {}, f.label + (f.required ? ' *' : '') + (isAgencyField ? ' (locked to current agency)' : '')),
       inputEl,
     ]);
+    fieldNodesByName[f.name] = node;
+    return node;
   });
+
+  // Section headings + a wider grid (repeat(auto-fill, minmax(...))) so more
+  // fields sit side by side on a wide screen instead of stacking in one
+  // narrow column — set inline so it applies regardless of the shared
+  // .form-grid rule elsewhere.
+  const sectionGrid = (nodes) => el('div', {
+    class: 'form-grid',
+    style: 'display:grid;grid-template-columns:repeat(auto-fill, minmax(230px, 1fr));gap:14px 20px;',
+  }, nodes);
+  const sectionHeading = (title) => el('h4', {
+    style: 'margin:0 0 10px;padding-bottom:6px;border-bottom:2px solid var(--border);font-size:.85rem;letter-spacing:.03em;text-transform:uppercase;color:var(--text-mute);',
+  }, title);
+
+  let fieldsArea;
+  if (ent.key === 'datatable') {
+    const usedNames = new Set(DATATABLE_FORM_HIDDEN_FIELDS);
+    const sectionEls = DATATABLE_FORM_SECTIONS.map(sec => {
+      const nodes = sec.fields.map(name => { usedNames.add(name); return fieldNodesByName[name]; }).filter(Boolean);
+      if (!nodes.length) return null;
+      return el('div', { class: 'form-section', style: 'margin-bottom:20px;' }, [sectionHeading(sec.title), sectionGrid(nodes)]);
+    }).filter(Boolean);
+
+    // Anything in entities.js not explicitly grouped above (still shown —
+    // never silently dropped) — in its original field order.
+    const restNodes = ent.fields.filter(f => !usedNames.has(f.name)).map(f => fieldNodesByName[f.name]).filter(Boolean);
+    if (restNodes.length) {
+      sectionEls.push(el('div', { class: 'form-section' }, [sectionHeading('Other Details'), sectionGrid(restNodes)]));
+    }
+    fieldsArea = el('div', {}, sectionEls);
+  } else {
+    fieldsArea = el('div', { class: 'form-grid' }, fieldNodes);
+  }
 
   if (ent.key === 'datatable') {
     // Name of Agency / Name of Owner / Lic No: always the logged-in
     // agency's own COMPANY record, not something entered per-row.
-    const companyEnt = entityByKey('company');
-    const myCompany = (cache[companyEnt.table] || [])
-      .find(c => String(c[companyEnt.pk]) === String(currentAgencyId));
+    const myCompany = currentAgencyRow();
     Object.entries(DATATABLE_AGENCY_AUTOFILL).forEach(([dtField, coField]) => {
       if (!inputs[dtField]) return;
       inputs[dtField].value = myCompany ? (myCompany[coField] ?? '') : '';
@@ -881,6 +1296,13 @@ async function openForm(ent, existingRow) {
         inputs[dtField].value = empRow ? (empRow[empField] ?? '') : '';
         inputs[dtField].disabled = true;
       });
+      // EMPID itself — same derived/locked treatment as the rest of the
+      // employer-sourced fields above, so the candidate's own EMPID always
+      // matches the employer that its Category actually belongs to.
+      if (inputs.EMPID) {
+        inputs.EMPID.value = empRow ? String(empRow[empEnt.pk] ?? '') : '';
+        inputs.EMPID.disabled = true;
+      }
     };
 
     if (inputs.CATEGORYID) {
@@ -891,6 +1313,52 @@ async function openForm(ent, existingRow) {
       // employer rather than whatever was saved historically).
       applyCategoryAutofill(inputs.CATEGORYID.value);
     }
+  }
+
+  if (ent.key === 'employer') {
+    // Name of Agency / Name of Owner / License No on EMPLOYER: always the
+    // logged-in agency's own COMPANY record, same as on DATATABLE — not
+    // something typed in per-employer.
+    const myCompany = currentAgencyRow();
+    Object.entries(EMPLOYER_AGENCY_AUTOFILL).forEach(([empField, coField]) => {
+      if (!inputs[empField]) return;
+      inputs[empField].value = myCompany ? (myCompany[coField] ?? '') : '';
+      inputs[empField].disabled = true;
+    });
+  }
+
+  // "Get Data from KSA Tab" — only on a fresh Add, and only does anything
+  // when clicked. Nothing is read from any other tab automatically; this
+  // just asks the (optional) KSA SmartForm Bridge browser extension to
+  // look at whatever visa.mofa.gov.sa tab you currently have open and,
+  // if it finds one, report back what's on it right now.
+  let ksaPullBlock = null;
+  if (ent.key === 'datatable' && !existingRow) {
+    const ksaStatusMsg = el('div', { id: 're-ksa-status-msg', style: 'font-size:.78rem;color:var(--text-mute);margin-top:6px;' }, '');
+    const ksaBtn = el('button', {
+      type: 'button', class: 'btn btn-outline btn-sm',
+      onclick: () => {
+        if (document.body.getAttribute('data-re-ksa-bridge') !== 'ready') {
+          ksaStatusMsg.style.color = 'var(--danger)';
+          ksaStatusMsg.textContent = "The KSA SmartForm Bridge extension isn't installed or enabled in this browser.";
+          return;
+        }
+        ksaStatusMsg.style.color = '';
+        ksaStatusMsg.textContent = 'Looking for an open KSA SmartForm tab…';
+        document.dispatchEvent(new CustomEvent('re-ksa-pull-request'));
+      },
+    }, [el('i', { class: 'fa-solid fa-arrows-rotate' }), ' Get Data from KSA Tab']);
+
+    ksaPullBlock = el('div', {
+      class: 'f-field full',
+      style: 'background:var(--bg);border:1px dashed var(--border);border-radius:8px;padding:12px 14px;margin-bottom:6px;',
+    }, [
+      el('label', {}, 'Get Data from KSA Tab (optional)'),
+      el('div', { style: 'font-size:.78rem;color:var(--text-mute);margin-bottom:8px;' },
+        'Requires the KSA SmartForm Bridge browser extension and an open visa.mofa.gov.sa tab. Click to read that tab\'s Name / Father\'s Name / Passport No / Date of Birth / Place of Birth / Date of Issue / Date of Expiry / ID Number / Place of Issue / Home Address fields into this form — nothing is read until you click.'),
+      ksaBtn,
+      ksaStatusMsg,
+    ]);
   }
 
   const errBox = el('div', { class: 'login-err' }, '');
@@ -984,7 +1452,8 @@ async function openForm(ent, existingRow) {
       await showEntityList(ent);
     },
   }, [
-    el('div', { class: 'form-grid' }, fieldNodes),
+    ...(ksaPullBlock ? [ksaPullBlock] : []),
+    fieldsArea,
     errBox,
     el('div', { class: 'modal-actions' }, [
       el('button', { type: 'button', class: 'btn btn-outline', onclick: () => overlay.remove() }, 'Cancel'),
@@ -992,7 +1461,19 @@ async function openForm(ent, existingRow) {
     ]),
   ]);
 
-  const box = el('div', { class: 'modal-box' }, [
+  const boxAttrs = {
+    class: 'modal-box',
+    'data-re-entity': ent.key,
+    'data-re-mode': existingRow ? 'edit' : 'add',
+  };
+  // DATATABLE's form has 70+ fields across several sections — give it a
+  // wide, near-full-screen box (instead of the narrower default modal width)
+  // so it reads sensibly across the horizontal space, with its own scroll
+  // for when the sections together are taller than the screen.
+  if (ent.key === 'datatable') {
+    boxAttrs.style = 'width:min(96vw, 1600px);max-width:1600px;max-height:92vh;overflow-y:auto;';
+  }
+  const box = el('div', boxAttrs, [
     el('button', { class: 'modal-close', onclick: () => overlay.remove() }, '✕'),
     el('h3', {}, existingRow ? `Edit ${ent.label.replace(/s$/, '')}` : `Add ${ent.label.replace(/s$/, '')}`),
     form,
@@ -1249,21 +1730,38 @@ function printLedgerReport(ent) {
   // Sort oldest -> newest so the running balance reads correctly top to bottom.
   const sorted = [...rows].sort((a, b) => new Date(a.DATE || 0) - new Date(b.DATE || 0));
 
+  // Agent Ledger gets two extra columns, Exp and Other, shown as their own
+  // breakdown alongside Credit (which already includes them in its total —
+  // see below) — Employer Ledger has no "exp" concept, so its table stays
+  // as-is at 5 columns.
+  const columns = isAgent
+    ? ['Date', 'Description', 'Debit', 'Exp', 'Other', 'Credit', 'Balance']
+    : ['Date', 'Description', 'Debit', 'Credit', 'Balance'];
+  const isNumericCol = (i) => i >= 2; // every column except Date/Description is a number, right-aligned via the .num class
+
   let balance = 0;
-  let totalDebit = 0, totalCredit = 0;
+  let totalDebit = 0, totalExp = 0, totalOther = 0, totalCredit = 0;
   const bodyRows = sorted.map(row => {
     const debit = Number(row.DEBIT) || 0;
-    const credit = Number(row.CREDIT) || 0;
+    const exp = Number(row.exp) || 0;
+    const other = Number(row.other) || 0;
+    // Agent Ledger: Credit also includes the row's "exp" and "other" amounts
+    // (extra charges entered alongside the main Credit figure), so the
+    // statement's Credit column and running balance reflect the true total
+    // rather than just the base CREDIT value.
+    const credit = isAgent ? (Number(row.CREDIT) || 0) + exp + other : (Number(row.CREDIT) || 0);
     balance += debit - credit;
     totalDebit += debit;
+    totalExp += exp;
+    totalOther += other;
     totalCredit += credit;
-    return [
-      formatDateDMY(row.DATE),
-      esc(row.DESCRIPTION || '—'),
-      debit ? formatNumber(debit) : '—',
-      credit ? formatNumber(credit) : '—',
-      formatNumber(balance),
-    ];
+    const cells = [formatDateDMY(row.DATE), esc(row.DESCRIPTION || '—'), debit ? formatNumber(debit) : '—'];
+    if (isAgent) {
+      cells.push(exp ? formatNumber(exp) : '—');
+      cells.push(other ? formatNumber(other) : '—');
+    }
+    cells.push(credit ? formatNumber(credit) : '—', formatNumber(balance));
+    return cells;
   });
 
   const title = isAgent ? 'Agent Ledger — Statement of Account' : 'Employer Ledger — Statement of Account';
@@ -1285,7 +1783,8 @@ function printLedgerReport(ent) {
       table{width:100%;border-collapse:collapse;font-size:12.5px;margin-bottom:4px;}
       th{background:#1a1a1a;color:#fff;padding:8px 10px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
       td{padding:7px 10px;border-bottom:1px solid #ddd;}
-      td:nth-child(3),td:nth-child(4),td:nth-child(5),th:nth-child(3),th:nth-child(4),th:nth-child(5){text-align:right;}
+      td:nth-child(1){white-space:nowrap;}
+      .num{text-align:right;}
       tbody tr:nth-child(even){background:#fafafa;}
       tfoot td{border-top:2px solid #1a1a1a;border-bottom:none;font-weight:bold;padding-top:10px;}
       .closing-row td{font-size:14px;padding-top:12px;}
@@ -1314,11 +1813,11 @@ function printLedgerReport(ent) {
       </div>
     </div>
     <table>
-      <thead><tr><th>Date</th><th>Description</th><th>Debit</th><th>Credit</th><th>Balance</th></tr></thead>
-      <tbody>${bodyRows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody>
+      <thead><tr>${columns.map((c, i) => `<th${isNumericCol(i) ? ' class="num"' : ''}>${esc(c)}</th>`).join('')}</tr></thead>
+      <tbody>${bodyRows.map(r => `<tr>${r.map((c, i) => `<td${isNumericCol(i) ? ' class="num"' : ''}>${c}</td>`).join('')}</tr>`).join('')}</tbody>
       <tfoot>
-        <tr><td colspan="2">Totals</td><td>${formatNumber(totalDebit)}</td><td>${formatNumber(totalCredit)}</td><td></td></tr>
-        <tr class="closing-row"><td colspan="4">Closing Balance</td><td>${formatNumber(Math.abs(balance))} ${balanceWord}</td></tr>
+        <tr><td colspan="2">Totals</td><td class="num">${formatNumber(totalDebit)}</td>${isAgent ? `<td class="num">${formatNumber(totalExp)}</td><td class="num">${formatNumber(totalOther)}</td>` : ''}<td class="num">${formatNumber(totalCredit)}</td><td></td></tr>
+        <tr class="closing-row"><td colspan="${columns.length - 1}">Closing Balance</td><td class="num">${formatNumber(Math.abs(balance))} ${balanceWord}</td></tr>
       </tfoot>
     </table>
     <div class="footer-note">This statement was generated automatically from ${esc(CFG.APP_NAME || 'Recruit Expert')} and reflects entries recorded as of the generation date above.</div>
@@ -1327,8 +1826,15 @@ function printLedgerReport(ent) {
   const win = window.open('', '_blank');
   win.document.write(html);
   win.document.close();
-  win.focus();
-  win.print();
+  // Wait for the new tab to finish loading (styles applied, @page size
+  // registered, any images decoded) before printing. Calling win.print()
+  // immediately after document.close() can race the browser's layout/paint,
+  // which is what was causing the print preview to fall back to a default
+  // page size and render everything smaller than the A4/Letter size that was
+  // actually designed.
+  const doPrint = () => { win.focus(); win.print(); };
+  if (win.document.readyState === 'complete') setTimeout(doPrint, 150);
+  else win.onload = () => setTimeout(doPrint, 150);
 }
 
 /* ==========================================================================
@@ -1429,6 +1935,43 @@ async function renderReportsList() {
   ]));
 }
 
+// Loads PDF.js from CDN on first use only (not on every page load), so
+// "Add PDF" works without needing any change to index.html. Once loaded,
+// later calls reuse the same library instance instead of re-fetching it.
+let _pdfJsLoadPromise = null;
+function loadPdfJs() {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (_pdfJsLoadPromise) return _pdfJsLoadPromise;
+  _pdfJsLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+    script.onload = () => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      resolve(window.pdfjsLib);
+    };
+    script.onerror = () => reject(new Error('Could not load the PDF library — check your internet connection.'));
+    document.head.appendChild(script);
+  });
+  return _pdfJsLoadPromise;
+}
+
+// Renders page 1 of a PDF (given as an ArrayBuffer) to a PNG data URL, so it
+// can be dropped into the report canvas as a normal image element. Only
+// page 1 is used — this designer works on a single page, the same as every
+// other element type here.
+async function renderPdfFirstPageToDataUrl(arrayBuffer) {
+  const pdfjsLib = await loadPdfJs();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const page = await pdf.getPage(1);
+  const viewport = page.getViewport({ scale: 2 }); // 2x for print-quality sharpness
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+  return { dataUrl: canvas.toDataURL('image/png'), pageCount: pdf.numPages, w: viewport.width, h: viewport.height };
+}
+
 function renderReportDesigner(existingReport) {
   document.getElementById('pageTitle').textContent = (existingReport && existingReport.id) ? `Edit Report: ${existingReport.name}` : 'New Report';
   const content = document.getElementById('content');
@@ -1446,8 +1989,19 @@ function renderReportDesigner(existingReport) {
   ]);
   pageSizeSelect.value = pageSizeKey;
 
+  const empEnt = entityByKey('employer');
+  const catEnt = entityByKey('category');
   const fieldSelect = el('select', {}, [
     el('option', { value: '' }, '— Add a field —'),
+    el('optgroup', { label: 'Candidate (DATATABLE)' }, dtEnt.fields.map(f => el('option', { value: f.name }, f.label))),
+    el('optgroup', { label: 'Employer' }, empEnt.fields.map(f => el('option', { value: `EMPLOYER.${f.name}` }, f.label))),
+    el('optgroup', { label: 'Category' }, catEnt.fields.map(f => el('option', { value: `CATEGORY.${f.name}` }, f.label))),
+  ]);
+  // Same idea as fieldSelect, but drops a scannable Code128 barcode bound to
+  // the chosen field instead of plain text — e.g. Enumber or Visano so the
+  // printed form can be scanned at the counter.
+  const barcodeSelect = el('select', {}, [
+    el('option', { value: '' }, '— Add a barcode —'),
     ...dtEnt.fields.map(f => el('option', { value: f.name }, f.label)),
   ]);
   const fileInput = el('input', { type: 'file', accept: 'image/*', style: 'display:none' });
@@ -1474,10 +2028,29 @@ function renderReportDesigner(existingReport) {
   fieldSelect.addEventListener('change', () => {
     const name = fieldSelect.value;
     if (!name) return;
+    let label = name;
+    if (name.startsWith('EMPLOYER.')) {
+      const f = empEnt.fields.find(x => x.name === name.slice('EMPLOYER.'.length));
+      label = f ? `Employer: ${f.label}` : name;
+    } else if (name.startsWith('CATEGORY.')) {
+      const f = catEnt.fields.find(x => x.name === name.slice('CATEGORY.'.length));
+      label = f ? `Category: ${f.label}` : name;
+    } else {
+      const f = dtEnt.fields.find(x => x.name === name);
+      label = f ? f.label : name;
+    }
+    const pos = nextPos();
+    addElement({ type: 'field', field: name, label, x: pos.x, y: pos.y, w: 180, h: 28, fontSize: 14 });
+    fieldSelect.value = '';
+  });
+
+  barcodeSelect.addEventListener('change', () => {
+    const name = barcodeSelect.value;
+    if (!name) return;
     const f = dtEnt.fields.find(x => x.name === name);
     const pos = nextPos();
-    addElement({ type: 'field', field: name, label: f ? f.label : name, x: pos.x, y: pos.y, w: 180, h: 28, fontSize: 14 });
-    fieldSelect.value = '';
+    addElement({ type: 'barcode', field: name, label: f ? f.label : name, x: pos.x, y: pos.y, w: 160, h: 50 });
+    barcodeSelect.value = '';
   });
 
   const addTextBtn = el('button', { class: 'btn btn-outline', onclick: () => {
@@ -1498,6 +2071,59 @@ function renderReportDesigner(existingReport) {
     fileInput.value = '';
   });
 
+  // Agency Header / Footer — a placeholder for whichever agency is logged in
+  // when the report is printed, not a fixed image baked into this one
+  // report. Lets the same saved report look right for every agency instead
+  // of needing a separate copy per agency's letterhead. Resolved at print
+  // time from the current agency's own COMPANY.HEADER / COMPANY.FOOTER
+  // value (set on the Companies page) — see buildCandidatePage below.
+  const addHeaderBtn = el('button', {
+    class: 'btn btn-outline', onclick: () => {
+      addElement({ type: 'agencyHeader', x: 0, y: 0, w: initialSize.w, h: 90 });
+    },
+    title: "Shows whichever agency's HEADER image is logged in at print time — set per agency on the Companies page.",
+  }, [el('i', { class: 'fa-solid fa-panorama' }), ' Add Agency Header']);
+  const addFooterBtn = el('button', {
+    class: 'btn btn-outline', onclick: () => {
+      addElement({ type: 'agencyFooter', x: 0, y: initialSize.h - 90, w: initialSize.w, h: 90 });
+    },
+    title: "Shows whichever agency's FOOTER image is logged in at print time — set per agency on the Companies page.",
+  }, [el('i', { class: 'fa-solid fa-panorama' }), ' Add Agency Footer']);
+
+  // "Add PDF" reuses the image element type under the hood — a PDF page,
+  // once rendered, is just a picture as far as this canvas is concerned.
+  // Only page 1 of the PDF is used (see renderPdfFirstPageToDataUrl).
+  const pdfInput = el('input', { type: 'file', accept: 'application/pdf', style: 'display:none' });
+  const addPdfBtn = el('button', {
+    class: 'btn btn-outline', onclick: () => pdfInput.click(),
+    title: 'Adds page 1 of the PDF as an image you can position and resize.',
+  }, [el('i', { class: 'fa-solid fa-file-pdf' }), ' Add PDF']);
+  pdfInput.addEventListener('change', async () => {
+    const file = pdfInput.files[0];
+    if (!file) return;
+    pdfInput.value = '';
+    addPdfBtn.disabled = true;
+    const originalLabel = addPdfBtn.innerHTML;
+    addPdfBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Converting PDF…';
+    try {
+      const buf = await file.arrayBuffer();
+      const { dataUrl, pageCount, w, h } = await renderPdfFirstPageToDataUrl(buf);
+      const pos = nextPos();
+      // Scale the initial box down to something reasonable to work with —
+      // the resize handle lets it be sized up or down afterward either way.
+      const scale = Math.min(1, 360 / w);
+      addElement({ type: 'image', src: dataUrl, x: pos.x, y: pos.y, w: Math.round(w * scale), h: Math.round(h * scale) });
+      if (pageCount > 1) toast(`Added page 1 of ${pageCount} — this designer only supports a single page per report.`);
+      else toast('PDF added.');
+    } catch (err) {
+      console.error(err);
+      toast('Could not convert that PDF: ' + err.message);
+    } finally {
+      addPdfBtn.disabled = false;
+      addPdfBtn.innerHTML = originalLabel;
+    }
+  });
+
   const saveBtn = el('button', { class: 'btn btn-primary', onclick: () => {
     const name = nameInput.value.trim();
     if (!name) { toast('Give the report a name first.'); return; }
@@ -1512,12 +2138,13 @@ function renderReportDesigner(existingReport) {
   const backBtn = el('button', { class: 'btn btn-outline', onclick: () => renderReportsList() }, 'Back to Reports');
 
   const toolbar = el('div', { class: 'toolbar', style: 'flex-wrap:wrap;gap:10px' }, [
-    nameInput, pageSizeSelect, fieldSelect, addTextBtn, addImageBtn, fileInput,
+    nameInput, pageSizeSelect, fieldSelect, barcodeSelect, addTextBtn, addImageBtn, fileInput, addPdfBtn, pdfInput,
+    addHeaderBtn, addFooterBtn,
     el('div', { style: 'flex:1' }),
     backBtn, saveBtn,
   ]);
   const hint = el('div', { style: 'text-align:center;color:#888;font-size:12px;margin-top:4px' },
-    'Drag any element to reposition it. Images have a resize handle in the bottom-right corner. Double-click text to edit it. Hover an element for its delete (×) button.');
+    'Drag any element to reposition it. Images and PDFs have a resize handle in the bottom-right corner. Double-click text to edit it. Hover an element for its delete (×) button. "Add PDF" brings in page 1 only.');
 
   content.appendChild(toolbar);
   content.appendChild(canvas);
@@ -1525,6 +2152,39 @@ function renderReportDesigner(existingReport) {
 
   // Load existing elements, if editing a saved report.
   (existingReport ? existingReport.elements : []).forEach(data => addElement(data));
+}
+
+// A small "A" − [size] + control that floats above a field/text element
+// (shown on hover, same as the delete button) so its font size can be set
+// to an exact number directly — not derived from resizing the box, which
+// only changes how much space the text has to sit in.
+function buildFontSizeControl(node, inner, initialSize) {
+  const sizeInput = el('input', {
+    type: 'number', min: '6', max: '96', value: String(initialSize),
+    style: 'width:38px;height:18px;font-size:11px;text-align:center;border:1px solid #93b4f5;border-radius:3px;padding:0;',
+  });
+  const apply = (v) => {
+    const n = Math.max(6, Math.min(96, parseInt(v) || initialSize));
+    sizeInput.value = String(n);
+    inner.style.fontSize = n + 'px';
+  };
+  sizeInput.addEventListener('input', () => apply(sizeInput.value));
+  sizeInput.addEventListener('mousedown', (e) => e.stopPropagation());
+  const step = (delta) => apply((parseInt(sizeInput.value) || initialSize) + delta);
+  const stepBtn = (label, delta) => el('div', {
+    style: 'width:16px;height:18px;line-height:18px;text-align:center;background:#1a56db;color:#fff;' +
+           'font-size:12px;border-radius:3px;cursor:pointer;user-select:none;',
+    onmousedown: (e) => e.stopPropagation(),
+    onclick: (e) => { e.stopPropagation(); step(delta); },
+  }, label);
+  const ctrl = el('div', {
+    class: 're-fontsize-ctrl',
+    style: 'position:absolute;top:-10px;left:-10px;display:none;align-items:center;gap:2px;' +
+           'background:#fff;border:1px solid #ddd;border-radius:4px;padding:2px;z-index:6;box-shadow:0 1px 3px rgba(0,0,0,.2);',
+  }, [stepBtn('−', -1), sizeInput, stepBtn('+', 1)]);
+  node.addEventListener('mouseenter', () => { ctrl.style.display = 'flex'; });
+  node.addEventListener('mouseleave', () => { ctrl.style.display = 'none'; });
+  return ctrl;
 }
 
 function buildDesignerElement(data) {
@@ -1548,20 +2208,42 @@ function buildDesignerElement(data) {
   if (data.type === 'field') {
     node.dataset.field = data.field;
     node.dataset.label = data.label;
+    node.style.width = (data.w || 180) + 'px';
+    node.style.height = (data.h || 28) + 'px';
+    const baseFontSize = data.fontSize || 14;
     const inner = el('div', {
-      style: `font-size:${data.fontSize || 14}px;color:#1a56db;font-style:italic;padding:3px 6px;` +
-             `background:#eef3ff;border:1px dashed #93b4f5;border-radius:4px;white-space:nowrap;`,
+      style: `font-size:${baseFontSize}px;color:#1a56db;font-style:italic;padding:3px 6px;` +
+             `background:#eef3ff;border:1px dashed #93b4f5;border-radius:4px;box-sizing:border-box;` +
+             `width:100%;height:100%;overflow:hidden;white-space:normal;word-break:break-word;`,
     }, `{{${data.label}}}`);
     node.appendChild(inner);
+    node.appendChild(buildFontSizeControl(node, inner, baseFontSize));
+    const handle = el('div', {
+      style: 'position:absolute;right:-6px;bottom:-6px;width:14px;height:14px;background:#1a56db;' +
+             'border-radius:3px;cursor:nwse-resize;z-index:5;',
+    });
+    node.appendChild(handle);
+    makeResizable(handle, node);
   } else if (data.type === 'text') {
+    node.style.width = (data.w || 200) + 'px';
+    node.style.height = (data.h || 28) + 'px';
+    const baseFontSize = data.fontSize || 14;
     const inner = el('div', {
       contenteditable: 'false',
-      style: `font-size:${data.fontSize || 14}px;padding:3px 6px;min-width:40px;min-height:20px;` +
+      style: `font-size:${baseFontSize}px;padding:3px 6px;box-sizing:border-box;` +
+             `width:100%;height:100%;overflow:hidden;word-break:break-word;` +
              `border:1px dashed transparent;`,
       ondblclick: (e) => { e.stopPropagation(); inner.contentEditable = 'true'; inner.style.borderColor = '#999'; inner.focus(); },
       onblur: () => { inner.contentEditable = 'false'; inner.style.borderColor = 'transparent'; },
     }, data.text || 'Text');
     node.appendChild(inner);
+    node.appendChild(buildFontSizeControl(node, inner, baseFontSize));
+    const handle = el('div', {
+      style: 'position:absolute;right:-6px;bottom:-6px;width:14px;height:14px;background:#1a56db;' +
+             'border-radius:3px;cursor:nwse-resize;z-index:5;',
+    });
+    node.appendChild(handle);
+    makeResizable(handle, node);
   } else if (data.type === 'image') {
     const img = el('img', {
       src: data.src, style: 'display:block;width:100%;height:100%;object-fit:contain;pointer-events:none;',
@@ -1569,6 +2251,54 @@ function buildDesignerElement(data) {
     node.style.width = (data.w || 140) + 'px';
     node.style.height = (data.h || 140) + 'px';
     node.appendChild(img);
+    const handle = el('div', {
+      style: 'position:absolute;right:-6px;bottom:-6px;width:14px;height:14px;background:#1a56db;' +
+             'border-radius:3px;cursor:nwse-resize;z-index:5;',
+    });
+    node.appendChild(handle);
+    makeResizable(handle, node);
+  } else if (data.type === 'barcode') {
+    // Design-time preview is just a striped placeholder — the actual scannable
+    // barcode (via JsBarcode) is only generated at print time once we know
+    // which candidate's field value to encode.
+    node.dataset.field = data.field;
+    node.dataset.label = data.label;
+    node.style.width = (data.w || 160) + 'px';
+    node.style.height = (data.h || 50) + 'px';
+    const stripes = el('div', {
+      style: 'width:100%;height:100%;background:repeating-linear-gradient(90deg,#222 0 2px,#fff 2px 4px);' +
+             'border:1px solid #999;pointer-events:none;',
+    });
+    const caption = el('div', {
+      style: 'position:absolute;left:0;top:100%;font-size:10px;color:#1a56db;background:#fff;' +
+             'padding:1px 4px;white-space:nowrap;pointer-events:none;',
+    }, `Barcode: ${data.label}`);
+    node.appendChild(stripes);
+    node.appendChild(caption);
+    const handle = el('div', {
+      style: 'position:absolute;right:-6px;bottom:-6px;width:14px;height:14px;background:#1a56db;' +
+             'border-radius:3px;cursor:nwse-resize;z-index:5;',
+    });
+    node.appendChild(handle);
+    makeResizable(handle, node);
+  } else if (data.type === 'agencyHeader' || data.type === 'agencyFooter') {
+    // Live preview shows the CURRENT logged-in agency's actual header/footer
+    // image if it has one set — accurate, since printing always resolves
+    // this the same way, from whichever agency is logged in at print time.
+    const isHeader = data.type === 'agencyHeader';
+    node.style.width = (data.w || 700) + 'px';
+    node.style.height = (data.h || 90) + 'px';
+    const agency = currentAgencyRow();
+    const src = agency ? agency[isHeader ? 'HEADER' : 'FOOTER'] : '';
+    if (src) {
+      const img = el('img', { src, style: 'display:block;width:100%;height:100%;object-fit:contain;pointer-events:none;' });
+      node.appendChild(img);
+    } else {
+      node.appendChild(el('div', {
+        style: 'width:100%;height:100%;display:flex;align-items:center;justify-content:center;' +
+               'background:#f3f4f6;border:1px dashed #999;color:#888;font-size:12px;text-align:center;pointer-events:none;',
+      }, `Agency ${isHeader ? 'Header' : 'Footer'} — logged-in agency has none set yet`));
+    }
     const handle = el('div', {
       style: 'position:absolute;right:-6px;bottom:-6px;width:14px;height:14px;background:#1a56db;' +
              'border-radius:3px;cursor:nwse-resize;z-index:5;',
@@ -1587,15 +2317,24 @@ function readDesignerElement(node) {
   const y = parseInt(node.style.top) || 0;
   const type = node.dataset.type;
   if (type === 'field') {
-    return { type, field: node.dataset.field, label: node.dataset.label, x, y };
+    const inner = node.querySelector('div');
+    const fontSize = inner ? (parseInt(inner.style.fontSize) || 14) : 14;
+    return { type, field: node.dataset.field, label: node.dataset.label, x, y, w: node.offsetWidth, h: node.offsetHeight, fontSize };
   }
   if (type === 'text') {
     const inner = node.querySelector('div');
-    return { type, text: inner ? inner.innerText : '', x, y };
+    const fontSize = inner ? (parseInt(inner.style.fontSize) || 14) : 14;
+    return { type, text: inner ? inner.innerText : '', x, y, w: node.offsetWidth, h: node.offsetHeight, fontSize };
   }
   if (type === 'image') {
     const img = node.querySelector('img');
     return { type, src: img ? img.src : '', x, y, w: node.offsetWidth, h: node.offsetHeight };
+  }
+  if (type === 'barcode') {
+    return { type, field: node.dataset.field, label: node.dataset.label, x, y, w: node.offsetWidth, h: node.offsetHeight };
+  }
+  if (type === 'agencyHeader' || type === 'agencyFooter') {
+    return { type, x, y, w: node.offsetWidth, h: node.offsetHeight };
   }
   return { type, x, y };
 }
@@ -1607,6 +2346,7 @@ function readDesignerElement(node) {
 function makeDraggable(node) {
   node.addEventListener('mousedown', (e) => {
     if (e.target.classList.contains('re-del-btn')) return;
+    if (e.target.closest && e.target.closest('.re-fontsize-ctrl')) return;
     if (node.dataset.type === 'text' && document.activeElement === node.querySelector('[contenteditable="true"]')) return;
     if (e.target.style && e.target.style.cursor === 'nwse-resize') return;
     e.preventDefault();
@@ -1625,14 +2365,17 @@ function makeDraggable(node) {
     document.addEventListener('mouseup', onUp);
   });
 }
-function makeResizable(handle, targetNode) {
+function makeResizable(handle, targetNode, onResize) {
   handle.addEventListener('mousedown', (e) => {
     e.stopPropagation(); e.preventDefault();
     const startX = e.clientX, startY = e.clientY;
     const startW = targetNode.offsetWidth, startH = targetNode.offsetHeight;
     function onMove(ev) {
-      targetNode.style.width = Math.max(30, startW + (ev.clientX - startX)) + 'px';
-      targetNode.style.height = Math.max(30, startH + (ev.clientY - startY)) + 'px';
+      const newW = Math.max(30, startW + (ev.clientX - startX));
+      const newH = Math.max(30, startH + (ev.clientY - startY));
+      targetNode.style.width = newW + 'px';
+      targetNode.style.height = newH + 'px';
+      if (onResize) onResize(newW, newH, startW, startH);
     }
     function onUp() {
       document.removeEventListener('mousemove', onMove);
@@ -1646,25 +2389,78 @@ function makeResizable(handle, targetNode) {
 // Printing: pick which candidate to print this report for, then render the
 // same layout with {{field}} placeholders replaced by that candidate's real
 // data, in a new tab, and trigger the browser's print dialog.
-function openReportPrintPicker(report) {
+async function openReportPrintPicker(report) {
+  // Employer/Category fields can appear on a report (see fieldSelect below),
+  // so their tables need to be in cache before Print is even opened — not
+  // just before the final print — otherwise their values could momentarily
+  // show blank if this page loaded before those tables were ever fetched.
+  await preloadRefCaches();
   const dtEnt = entityByKey('datatable');
+  const empEnt = entityByKey('employer');
+  const catEnt = entityByKey('category');
   const candidates = [...(cache[dtEnt.table] || [])].sort((a, b) => (b.DID ?? 0) - (a.DID ?? 0));
-  const options = [el('option', { value: '' }, '— Select a candidate —')]
-    .concat(candidates.map(c => el('option', { value: String(c[dtEnt.pk]) }, `${c.NAME || '(no name)'}${c.PASSPORTNO ? ' — ' + c.PASSPORTNO : ''}`)));
-  const select = el('select', { style: 'width:100%' }, options);
+
+  // Employer and Candidate are two independent ways to print — picking
+  // either one is enough on its own. Printing straight from Employer has no
+  // specific candidate, so any candidate-specific fields (Name, Passport,
+  // etc.) just print blank — but since one Employer can have SEVERAL
+  // Category rows (different demands: different salary/quantity per
+  // category), picking the Employer alone isn't enough to know which one's
+  // Category/Salary/Quantity to show. The Category dropdown below narrows
+  // that down once an Employer is chosen.
+  const employerSelect = el('select', { style: 'width:100%' }, [
+    el('option', { value: '' }, '— none —'),
+    ...(cache[empEnt.table] || []).map(r => el('option', { value: String(r[empEnt.pk]) }, r[empEnt.displayField] ?? `#${r[empEnt.pk]}`)),
+  ]);
+  const categorySelect = el('select', { style: 'width:100%' }, [el('option', { value: '' }, '— pick an Employer first —')]);
+  employerSelect.addEventListener('change', () => {
+    const empId = employerSelect.value;
+    const cats = (cache[catEnt.table] || []).filter(c => String(c.EMPID) === empId);
+    categorySelect.innerHTML = '';
+    if (!cats.length) {
+      categorySelect.appendChild(el('option', { value: '' }, '— this employer has no categories —'));
+      return;
+    }
+    categorySelect.appendChild(el('option', { value: '' }, '— none —'));
+    if (cats.length > 1) {
+      categorySelect.appendChild(el('option', { value: '__ALL__' }, `— All ${cats.length} categories (list all on one page) —`));
+    }
+    cats.forEach(c => {
+      const label = `${c.CATEGORY || '(no name)'}${c.SALARY ? ' — Salary: ' + c.SALARY : ''}${c.QUANTITY ? ' — Qty: ' + c.QUANTITY : ''}`;
+      categorySelect.appendChild(el('option', { value: String(c[catEnt.pk]) }, label));
+    });
+  });
+  const candidateSelect = el('select', { style: 'width:100%' }, [
+    el('option', { value: '' }, '— none —'),
+    ...candidates.map(c => el('option', { value: String(c[dtEnt.pk]) }, `${c.NAME || '(no name)'}${c.PASSPORTNO ? ' — ' + c.PASSPORTNO : ''}`)),
+  ]);
 
   const overlay = el('div', { class: 'modal-overlay' }, [
     el('div', { class: 'modal-box', style: 'max-width:420px' }, [
       el('h3', {}, `Print "${report.name}" for…`),
-      select,
+      el('div', { class: 'f-field' }, [el('label', {}, 'Print for an Employer'), employerSelect]),
+      el('div', { class: 'f-field' }, [el('label', {}, 'Which Category / demand?'), categorySelect]),
+      el('div', { class: 'f-field' }, [el('label', {}, 'Or print for a Candidate'), candidateSelect]),
       el('div', { style: 'margin-top:16px;display:flex;justify-content:flex-end;gap:8px' }, [
         el('button', { class: 'btn btn-outline', onclick: () => overlay.remove() }, 'Cancel'),
         el('button', { class: 'btn btn-primary', onclick: () => {
-          const id = select.value;
-          if (!id) { toast('Pick a candidate first.'); return; }
-          const cand = candidates.find(c => String(c[dtEnt.pk]) === id);
-          overlay.remove();
-          printReportForCandidate(report, cand);
+          const candId = candidateSelect.value;
+          const empId = employerSelect.value;
+          const catId = categorySelect.value;
+          if (candId) {
+            const cand = candidates.find(c => String(c[dtEnt.pk]) === candId);
+            overlay.remove();
+            printReportForCandidate(report, cand);
+          } else if (empId) {
+            // No candidate row at all — just enough of a stand-in object so
+            // resolveFieldValue's EMPLOYER.* lookup (via EMPID) and CATEGORY.*
+            // lookup (via CATEGORYID, if a specific one was picked above)
+            // still work correctly.
+            overlay.remove();
+            printReportForCandidate(report, { EMPID: empId, CATEGORYID: catId || undefined });
+          } else {
+            toast('Pick an Employer or a Candidate first.');
+          }
         } }, 'Print'),
       ]),
     ]),
@@ -1685,47 +2481,256 @@ function openVisaFormKhi() {
   }
 }
 
-function printReportForCandidate(report, candidate) {
-  const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const size = PAGE_SIZES[report.pageSize] || PAGE_SIZES.letter;
+// Same idea for the Islamabad consulate's form.
+function openVisaFormIsb() {
+  const reports = loadSavedReports();
+  const match = reports.find(r => /visa\s*form\s*(islamabad|isb)/i.test(r.name));
+  if (match) { openReportPrintPicker(match); return; }
+  if (confirm('No "Visa Form ISB" report has been designed yet. Design it now?')) {
+    renderReportDesigner({ id: null, name: 'Visa Form ISB', elements: [] });
+  }
+}
+
+// Reports can place a field from DATATABLE directly (field: "NAME"), or one
+// from the candidate's linked Employer/Category record (field:
+// "EMPLOYER.ARBICCOMPANY" / "CATEGORY.CATEGORYARBIC") — see the grouped
+// "Add a field" dropdown in the report designer.
+//
+// DATATABLE has no direct EMPID column, so Employer is reached two ways:
+//   1. Directly via candidate.EMPID, when printing via the Employer picker
+//      (that flow builds a stand-in object with EMPID set directly).
+//   2. Otherwise via the candidate's own Category (CATEGORYID -> that
+//      Category row's EMPID) — the real path for an actual Candidate row.
+// Category is reached directly via candidate.CATEGORYID. If any link in the
+// chain is missing or the linked row can't be found, the field just prints
+// blank rather than erroring.
+function resolveFieldValue(candidate, fieldKey) {
+  if (!candidate) return '';
+  const findCategoryForCandidate = () => {
+    if (candidate.CATEGORYID == null) return null;
+    return (cache.CATEGORY || []).find(r => String(r.CATEGORYID) === String(candidate.CATEGORYID)) || null;
+  };
+  if (fieldKey.startsWith('EMPLOYER.')) {
+    const name = fieldKey.slice('EMPLOYER.'.length);
+    let empId = candidate.EMPID;
+    if (empId == null) {
+      const cat = findCategoryForCandidate();
+      empId = cat ? cat.EMPID : null;
+    }
+    if (empId == null) return '';
+    const emp = (cache.EMPLOYER || []).find(r => String(r.EMPID) === String(empId));
+    return emp ? emp[name] : '';
+  }
+  if (fieldKey.startsWith('CATEGORY.')) {
+    const name = fieldKey.slice('CATEGORY.'.length);
+    const cat = findCategoryForCandidate();
+    return cat ? cat[name] : '';
+  }
+  return candidate[fieldKey];
+}
+
+// Builds the HTML for ONE candidate's page of a report, plus any JsBarcode
+// init calls it needs. Shared by both the single-candidate print (Reports
+// page) and the bulk multi-candidate print (Search Candidates, below) — the
+// only difference is how many of these get joined into one print document,
+// and barcodeCounter is passed in so barcode element ids stay unique when
+// multiple candidates' pages share one HTML document.
+function buildCandidatePage(report, candidate, esc, barcodeCounter) {
+  const barcodeInits = [];
   const pieces = (report.elements || []).map(elData => {
     const base = `position:absolute;left:${elData.x}px;top:${elData.y}px;`;
     if (elData.type === 'field') {
-      const val = candidate ? candidate[elData.field] : '';
-      return `<div style="${base}font-size:14px;">${esc(val ?? '')}</div>`;
+      // Special case: printing "All categories" for an Employer (see the
+      // picker below) repeats THIS field once per category row that
+      // employer has, stacked downward from where it was placed in the
+      // designer — instead of a single value.
+      if (elData.field.startsWith('CATEGORY.') && candidate.CATEGORYID === '__ALL__') {
+        const catName = elData.field.slice('CATEGORY.'.length);
+        // The Category list's checkbox print passes the exact rows that
+        // were checked (candidate.__categoryRows__); the Reports page's
+        // Employer picker has no such selection, so it falls back to every
+        // category that employer has.
+        const rows = candidate.__categoryRows__ ||
+          (cache.CATEGORY || []).filter(c => String(c.EMPID) === String(candidate.EMPID));
+        const rowHeight = elData.rowHeight || 24;
+        const box = elData.w ? `width:${elData.w}px;${elData.h ? `height:${elData.h}px;` : ''}white-space:normal;word-break:break-word;overflow:hidden;` : 'white-space:nowrap;';
+        return rows.map((r, i) =>
+          `<div style="position:absolute;left:${elData.x}px;top:${elData.y + i * rowHeight}px;font-size:${elData.fontSize || 14}px;${box}">${esc(r[catName] ?? '')}</div>`
+        ).join('\n');
+      }
+      const val = resolveFieldValue(candidate, elData.field);
+      const box = elData.w ? `width:${elData.w}px;${elData.h ? `height:${elData.h}px;` : ''}white-space:normal;word-break:break-word;overflow:hidden;` : 'white-space:nowrap;';
+      return `<div style="${base}font-size:${elData.fontSize || 14}px;${box}">${esc(val ?? '')}</div>`;
     }
     if (elData.type === 'text') {
-      return `<div style="${base}font-size:14px;">${esc(elData.text)}</div>`;
+      const box = elData.w ? `width:${elData.w}px;${elData.h ? `height:${elData.h}px;` : ''}white-space:normal;word-break:break-word;overflow:hidden;` : 'white-space:nowrap;';
+      return `<div style="${base}font-size:${elData.fontSize || 14}px;${box}">${esc(elData.text)}</div>`;
     }
     if (elData.type === 'image') {
       return `<img src="${elData.src}" style="${base}width:${elData.w}px;height:${elData.h}px;object-fit:contain;">`;
     }
+    if (elData.type === 'barcode') {
+      const val = resolveFieldValue(candidate, elData.field);
+      const id = `bc${barcodeCounter.n++}`;
+      if (val != null && String(val).trim() !== '') {
+        const barHeight = Math.max(20, (elData.h || 50) - 18);
+        barcodeInits.push(
+          `try { JsBarcode("#${id}", ${JSON.stringify(String(val))}, ` +
+          `{ format: "CODE128", displayValue: true, height: ${barHeight}, margin: 0, fontSize: 12 }); } ` +
+          `catch (e) { console.error('Barcode failed for ${elData.field}:', e); }`
+        );
+      }
+      return `<div style="${base}width:${elData.w}px;height:${elData.h}px;">` +
+             `<svg id="${id}" style="display:block;width:100%;height:100%;"></svg></div>`;
+    }
+    if (elData.type === 'agencyHeader' || elData.type === 'agencyFooter') {
+      // Resolved from whoever is logged in RIGHT NOW, not from the report
+      // itself — so the same saved report shows each agency's own
+      // letterhead automatically. currentAgencyRow() reads from cache, no
+      // extra round trip. Renders nothing if that agency hasn't set one.
+      const agency = currentAgencyRow();
+      const src = agency ? agency[elData.type === 'agencyHeader' ? 'HEADER' : 'FOOTER'] : '';
+      if (!src) return '';
+      return `<img src="${src}" style="${base}width:${elData.w}px;height:${elData.h}px;object-fit:contain;">`;
+    }
     return '';
   }).join('\n');
+  return { pieces, barcodeInits };
+}
 
-  // Explicitly declaring the physical page size (not "auto") is what stops
-  // the browser from silently shrinking the page to fit its own guess of
-  // the printable area — this is what was making the preview look smaller
-  // than the design.
+// Opens one print window containing every candidate's page back to back,
+// each sized and scaled identically to the single-candidate print, with a
+// page break in between so each candidate comes out on their own sheet.
+// One row of report-print buttons. getSelectedRows() is called at click time
+// (not once up front) so it always reflects whatever's currently checked.
+// Shared by the Search Candidates page and the Employer list's print section.
+function buildReportButtonsRow(reports, getSelectedRows) {
+  if (!reports.length) return el('div', {});
+  // margin:0 overrides whatever vertical margin the shared .toolbar class
+  // normally adds between stacked sections — without it, this row ends up
+  // with a visible gap above/below even though the buttons inside it are
+  // already tight against each other (gap:8px, side by side, wrapping only
+  // when the row runs out of width).
+  return el('div', { class: 'toolbar', style: 'flex-wrap:wrap;gap:0;margin:0;' },
+    reports.map(r => el('button', {
+      class: 'btn btn-outline',
+      // The shared .btn class applies its own margin for buttons used
+      // standalone elsewhere in the app — that's what was still leaving a
+      // gap here even with the container's own gap:0, since gap only
+      // controls spacing it adds itself, not each button's own margin.
+      // Overriding it inline (which always wins over a stylesheet class,
+      // regardless of CSS specificity) is what actually removes it.
+      style: 'margin:0;border-radius:0;',
+      onclick: () => printReportForCandidates(r, getSelectedRows()),
+    }, [el('i', { class: 'fa-solid fa-print' }), ` ${r.name}`]))
+  );
+}
+
+function printReportForCandidates(report, candidates) {
+  if (!candidates.length) { toast('Select at least one candidate first.'); return; }
+  const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const size = PAGE_SIZES[report.pageSize] || PAGE_SIZES.letter;
+  const barcodeCounter = { n: 0 };
+  const allBarcodeInits = [];
+  const pages = candidates.map((candidate, i) => {
+    const { pieces, barcodeInits } = buildCandidatePage(report, candidate, esc, barcodeCounter);
+    allBarcodeInits.push(...barcodeInits);
+    const breakStyle = i < candidates.length - 1 ? 'page-break-after:always;' : '';
+    return `<div class="scaleWrap" style="${breakStyle}"><div class="page">${pieces}</div></div>`;
+  }).join('\n');
+  const needsBarcodes = allBarcodeInits.length > 0;
+
+  const MARGIN_PX = 18; // ~4.5mm at 96dpi — see printReportForCandidate for why
+  const marginIn = (MARGIN_PX / 96).toFixed(4);
+  const innerW = size.w - MARGIN_PX * 2;
+  const innerH = size.h - MARGIN_PX * 2;
+  const scaleX = innerW / size.w;
+  const scaleY = innerH / size.h;
+
   const html = `<!DOCTYPE html><html><head><title>${esc(report.name)}</title>
+    ${needsBarcodes ? '<script src="https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.5/JsBarcode.all.min.js"><\/script>' : ''}
     <style>
       * { box-sizing: border-box; }
       html, body { margin:0; padding:0; }
-      .page { position:relative; width:${size.w}px; height:${size.h}px; margin:0 auto; font-family:Arial,sans-serif; color:#111; }
-      @page { size: ${size.cssSize}; margin: 0; }
+      .scaleWrap { width:${innerW}px; height:${innerH}px; overflow:hidden; }
+      .page { position:relative; width:${size.w}px; height:${size.h}px; transform:scale(${scaleX.toFixed(6)}, ${scaleY.toFixed(6)}); transform-origin:top left; font-family:Arial,sans-serif; color:#111; }
+      @page { size: ${size.cssSize}; margin: ${marginIn}in; }
       @media print {
-        html, body { width:${size.w}px; height:${size.h}px; }
-        .page { margin:0; }
+        html, body { width:${innerW}px; height:${innerH}px; }
       }
     </style></head><body>
-    <div class="page">${pieces}</div>
+    ${pages}
+    ${needsBarcodes ? `<script>${allBarcodeInits.join('\n')}<\/script>` : ''}
     </body></html>`;
 
   const win = window.open('', '_blank');
   win.document.write(html);
   win.document.close();
-  win.focus();
-  win.print();
+  const doPrint = () => { win.focus(); win.print(); };
+  if (win.document.readyState === 'complete') setTimeout(doPrint, 150);
+  else win.onload = () => setTimeout(doPrint, 150);
+}
+
+function printReportForCandidate(report, candidate) {
+  const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const size = PAGE_SIZES[report.pageSize] || PAGE_SIZES.letter;
+  const barcodeCounter = { n: 0 };
+  const { pieces, barcodeInits } = buildCandidatePage(report, candidate, esc, barcodeCounter);
+  const needsBarcodes = barcodeInits.length > 0;
+
+  // Real printers, unlike "Save as PDF", almost always have a small strip
+  // around the edge of the paper they physically cannot print to. When the
+  // page CSS asks for 0 margin (full bleed) — like before — a real printer
+  // driver has no choice but to auto-shrink the WHOLE page by however much
+  // it needs to fit everything inside that strip, and that shrink amount is
+  // unpredictable and differs printer to printer. "Save as PDF" is a virtual
+  // printer with no such physical limit, so it always prints at the exact
+  // requested size — which is why it looked right there but not from a real
+  // printer.
+  //
+  // Fix: build in a small (~4.5mm) safety margin ourselves, and scale the
+  // designed page down by that same small, exact, known amount so it already
+  // fits inside virtually every printer's real printable area. This makes
+  // printed output consistent and predictable on real hardware — at the cost
+  // of the page (and therefore "Save as PDF" too, from now on) being about
+  // 4% smaller than pure full-bleed. That's not visible to the eye, and it
+  // means the printer output will now match the PDF instead of coming out
+  // smaller than it.
+  const MARGIN_PX = 18; // ~4.5mm at 96dpi
+  const marginIn = (MARGIN_PX / 96).toFixed(4);
+  const innerW = size.w - MARGIN_PX * 2;
+  const innerH = size.h - MARGIN_PX * 2;
+  const scaleX = innerW / size.w;
+  const scaleY = innerH / size.h;
+
+  const html = `<!DOCTYPE html><html><head><title>${esc(report.name)}</title>
+    ${needsBarcodes ? '<script src="https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.5/JsBarcode.all.min.js"><\/script>' : ''}
+    <style>
+      * { box-sizing: border-box; }
+      html, body { margin:0; padding:0; }
+      .scaleWrap { width:${innerW}px; height:${innerH}px; overflow:hidden; }
+      .page { position:relative; width:${size.w}px; height:${size.h}px; transform:scale(${scaleX.toFixed(6)}, ${scaleY.toFixed(6)}); transform-origin:top left; font-family:Arial,sans-serif; color:#111; }
+      @page { size: ${size.cssSize}; margin: ${marginIn}in; }
+      @media print {
+        html, body { width:${innerW}px; height:${innerH}px; }
+      }
+    </style></head><body>
+    <div class="scaleWrap"><div class="page">${pieces}</div></div>
+    ${needsBarcodes ? `<script>${barcodeInits.join('\n')}<\/script>` : ''}
+    </body></html>`;
+
+  const win = window.open('', '_blank');
+  win.document.write(html);
+  win.document.close();
+  // Wait for the new tab to finish loading (styles applied, @page size
+  // registered, any images decoded) before printing. Calling win.print()
+  // immediately after document.close() can race the browser's layout/paint,
+  // which is what was causing the print preview to fall back to a default
+  // page size and render everything smaller than the A4/Letter size that was
+  // actually designed.
+  const doPrint = () => { win.focus(); win.print(); };
+  if (win.document.readyState === 'complete') setTimeout(doPrint, 150);
+  else win.onload = () => setTimeout(doPrint, 150);
 }
 
 
