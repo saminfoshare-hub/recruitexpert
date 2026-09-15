@@ -236,6 +236,19 @@ async function checkSession() {
     currentUser = saved.user;
     currentAgencyId = saved.agencyId;
     currentAgencyName = saved.agencyName || '';
+    // A session saved by an OLDER version of this app (from before
+    // agencyName was part of it) restores fine otherwise, but would show a
+    // permanently blank agency name — since nothing else ever re-derives
+    // it. Fix it once here, and re-save so it's correct from now on.
+    if (!currentAgencyName) {
+      try {
+        const { data } = await sb.from('COMPANY').select('AGENCYNAME').eq('AGENCYID', currentAgencyId).limit(1);
+        if (data && data[0]) {
+          currentAgencyName = data[0].AGENCYNAME || '';
+          saveSession({ user: currentUser, agencyId: currentAgencyId, agencyName: currentAgencyName });
+        }
+      } catch (e) { /* non-critical — worst case it just stays blank this time too */ }
+    }
     await boot();
   } else {
     await renderLogin();
@@ -254,14 +267,36 @@ async function renderLogin() {
   root.innerHTML = '';
   root.appendChild(el('div', { class: 'login-screen' }, el('div', { class: 'login-box' }, el('p', { class: 'sub' }, 'Loading accounts…'))));
 
-  const [{ data: users, error: userErr }, { data: companies, error: coErr }] = await Promise.all([
-    sb.from('tbl_User').select('lngUserID, strUserName').order('strUserName', { ascending: true }),
-    sb.from('COMPANY').select('AGENCYID, AGENCYNAME').order('AGENCYNAME', { ascending: true }),
-  ]);
+  // A network-level failure (blocked/broken CORS preflight, no internet,
+  // DNS failure, etc.) can make these calls THROW instead of cleanly
+  // returning { data: null, error }, depending on exactly how it fails —
+  // catching both means a broken connection always shows a real, visible
+  // message instead of silently leaving the dropdowns empty with no
+  // explanation at all.
+  let users = null, companies = null, loadError = null;
+  try {
+    const [userRes, coRes] = await Promise.all([
+      sb.from('tbl_User').select('lngUserID, strUserName').order('strUserName', { ascending: true }),
+      sb.from('COMPANY').select('AGENCYID, AGENCYNAME').order('AGENCYNAME', { ascending: true }),
+    ]);
+    users = userRes.data; companies = coRes.data;
+    loadError = userRes.error || coRes.error || null;
+  } catch (e) {
+    loadError = e;
+  }
 
   root.innerHTML = '';
   const errBox = el('div', { class: 'login-err' }, '');
-  if (userErr || coErr) errBox.textContent = 'Could not load login options: ' + (userErr || coErr).message;
+  if (loadError) {
+    errBox.style.cssText = 'background:#fee;border:1px solid #e53e3e;color:#c53030;padding:10px 12px;' +
+      'border-radius:6px;margin-bottom:12px;font-size:13px;line-height:1.5;';
+    errBox.innerHTML = `<b>Could not load the login list.</b><br>${(loadError.message || String(loadError))}<br>` +
+      `This usually means this device/network can't reach the server right now — check your internet connection, ` +
+      `or try a different network/browser if it keeps happening.`;
+  }
+  const retryBtn = loadError
+    ? el('button', { type: 'button', class: 'btn btn-outline', style: 'margin-bottom:12px', onclick: () => renderLogin() }, 'Retry')
+    : null;
 
   const userSelect = el('select', {}, [
     el('option', { value: '' }, '— Select user —'),
@@ -300,6 +335,7 @@ async function renderLogin() {
       await boot();
     }
   }, [
+    ...(retryBtn ? [retryBtn] : []),
     el('label', {}, 'User'), userSelect,
     el('label', {}, 'Password'), passInp,
     el('label', {}, 'Agency'), agencySelect,
@@ -2733,5 +2769,5 @@ function printReportForCandidate(report, candidate) {
   else win.onload = () => setTimeout(doPrint, 150);
 }
 
-checkSession();
 
+checkSession();
