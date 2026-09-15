@@ -2733,5 +2733,5 @@ function printReportForCandidate(report, candidate) {
   else win.onload = () => setTimeout(doPrint, 150);
 }
 
-
 checkSession();
+
