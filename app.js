@@ -786,7 +786,7 @@ async function renderSearchForm() {
       });
       return el('tr', {}, [
         el('td', {}, rowCheckbox),
-        ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name]))),
+        ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name], dtEnt, row))),
         el('td', {}, el('div', { class: 'row-actions' }, [
           el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(dtEnt, row) }, 'Edit'),
           el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(dtEnt, row) }, 'Delete'),
@@ -985,6 +985,8 @@ function refreshEntityListBody(ent) {
     // in entities.js. A name in the list that no longer exists as a field is
     // skipped rather than rendering a blank column.
     ? DATATABLE_LIST_FIELDS.map(name => ent.fields.find(f => f.name === name)).filter(Boolean)
+    : ent.key === 'employer'
+    ? ent.fields.filter(f => !EMPLOYER_HIDDEN_LIST_FIELDS.includes(f.name))
     : ent.fields; // show every column, matching the Supabase table exactly
   const hasPrintReports = !!(ent.printReports && ent.printReports.length);
   let selectAllBox = null;
@@ -1017,7 +1019,7 @@ function refreshEntityListBody(ent) {
     }
     return el('tr', {}, [
       ...(hasPrintReports ? [el('td', {}, rowCheckbox)] : []),
-      ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name]))),
+      ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name], ent, row))),
       el('td', {}, el('div', { class: 'row-actions' }, [
         el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(ent, row) }, 'Edit'),
         el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(ent, row) }, 'Delete'),
@@ -1078,7 +1080,35 @@ function pageBtn(p, current, onPageChange) {
   return el('button', { class: `btn btn-sm ${p === current ? 'btn-primary' : 'btn-outline'}`, onclick: () => onPageChange(p) }, String(p));
 }
 
-function formatCell(field, value) {
+function formatCell(field, value, ent, row) {
+  if (field.type === 'checkbox') {
+    // Editable right here when we know which row/table to write back to
+    // (both list views pass this); falls back to a plain read-only box
+    // otherwise rather than erroring.
+    const canEdit = !!(ent && row);
+    const cb = el('input', {
+      type: 'checkbox',
+      style: 'width:16px;height:16px;accent-color:#1a56db;vertical-align:middle;' + (canEdit ? 'cursor:pointer;' : 'cursor:default;'),
+    });
+    cb.checked = value === true;
+    cb.disabled = !canEdit;
+    if (canEdit) {
+      cb.addEventListener('change', async () => {
+        const newVal = cb.checked;
+        cb.disabled = true;
+        const { error } = await sb.from(ent.table).update({ [field.name]: newVal }).eq(ent.pk, row[ent.pk]);
+        cb.disabled = false;
+        if (error) {
+          cb.checked = !newVal; // revert the tick — the save didn't actually happen
+          toast(`Could not update ${field.label}: ${error.message}`);
+          return;
+        }
+        row[field.name] = newVal; // keep the in-memory row (and cache) in sync, no full reload needed
+        toast(`${field.label} updated.`);
+      });
+    }
+    return cb;
+  }
   if (value === null || value === undefined || value === '') return '—';
   if (field.type === 'select') {
     const refEnt = entityByKey(field.ref);
@@ -1249,6 +1279,21 @@ const DATATABLE_LIST_FIELDS = [
   'REMARKS',
 ];
 
+// The Employer list, unlike DATATABLE above, hides just a few columns
+// instead of naming everything it keeps — a denylist rather than an
+// allowlist. Also LIST ONLY: the Add/Edit Employer form still shows every
+// field.
+const EMPLOYER_HIDDEN_LIST_FIELDS = [
+  'nameofagency',
+  'nameofowner',
+  'license no',
+  'VISATYPE',
+  'CITY',
+  'ATTACHMENT',
+  'PERMISSIONNO',
+  'DATED',
+];
+
 // DATATABLE's Add/Edit form has 70+ fields — grouped into named sections
 // (in this order) so it reads as a form instead of a wall of boxes. Any
 // field not listed in any group below (and not in the hidden list above)
@@ -1313,6 +1358,12 @@ async function openForm(ent, existingRow) {
     if (f.type === 'textarea') {
       inputEl = el('textarea', {}, '');
       inputEl.value = val ?? '';
+    } else if (f.type === 'checkbox') {
+      // Real bool columns (e.g. Employer.ACTIVE) round-trip as actual JS
+      // true/false from Supabase, not the strings "True"/"False" — which is
+      // exactly what a checkbox's .checked wants, no string-matching needed.
+      inputEl = el('input', { type: 'checkbox', style: 'width:18px;height:18px;margin-top:6px;accent-color:#1a56db;' });
+      inputEl.checked = val === true;
     } else if (f.type === 'staticselect') {
       // A fixed list of choices defined right on the field (f.options) —
       // not looked up from another table, e.g. Active: True/False.
@@ -1480,7 +1531,7 @@ async function openForm(ent, existingRow) {
     }, [
       el('label', {}, 'Get Data from KSA Tab (optional)'),
       el('div', { style: 'font-size:.78rem;color:var(--text-mute);margin-bottom:8px;' },
-        'Requires the KSA SmartForm Bridge browser extension and an open visa.mofa.gov.sa tab. Click to read that tab\'s Name / Father\'s Name / Passport No / Date of Birth / Place of Birth / Date of Issue / Date of Expiry / ID Number / Place of Issue / Home Address fields into this form — nothing is read until you click.'),
+        'Requires the KSA SmartForm Bridge browser extension and an open visa.mofa.gov.sa tab. Click to read that tab\'s Name / Father\'s Name / Passport No / Date of Birth / Place of Birth / Date of Issue / Date of Expiry / ID Number / Place of Issue / Home Address / District / Marital Status / Sex / Qualification fields into this form — nothing is read until you click.'),
       ksaBtn,
       ksaStatusMsg,
     ]);
@@ -1496,24 +1547,29 @@ async function openForm(ent, existingRow) {
       const payload = {};
       let valid = true;
       ent.fields.forEach(f => {
-        let v = inputs[f.name].value;
-        if (f.type === 'number') v = v === '' ? null : Number(v);
-        else if (f.type === 'select') {
-          // Not every FK points at a numeric auto-ID — AGENT's primary key
-          // (COID) and possibly others are TEXT business codes. Forcing
-          // Number() on a non-numeric code produces NaN, which silently
-          // serializes to null in the request body — the row saves, but the
-          // link is quietly gone (this was breaking Receipts -> Agent
-          // Ledger whenever the selected agent's COID wasn't plain digits).
-          // Only convert when it actually parses as a real number; otherwise
-          // keep the original text value intact.
-          if (v === '') v = null;
-          else {
-            const n = Number(v);
-            v = Number.isNaN(n) ? v : n;
+        let v;
+        if (f.type === 'checkbox') {
+          v = inputs[f.name].checked;
+        } else {
+          v = inputs[f.name].value;
+          if (f.type === 'number') v = v === '' ? null : Number(v);
+          else if (f.type === 'select') {
+            // Not every FK points at a numeric auto-ID — AGENT's primary key
+            // (COID) and possibly others are TEXT business codes. Forcing
+            // Number() on a non-numeric code produces NaN, which silently
+            // serializes to null in the request body — the row saves, but the
+            // link is quietly gone (this was breaking Receipts -> Agent
+            // Ledger whenever the selected agent's COID wasn't plain digits).
+            // Only convert when it actually parses as a real number; otherwise
+            // keep the original text value intact.
+            if (v === '') v = null;
+            else {
+              const n = Number(v);
+              v = Number.isNaN(n) ? v : n;
+            }
           }
+          else v = v === '' ? null : v;
         }
-        else v = v === '' ? null : v;
         if (f.required && (v === null || v === '')) valid = false;
         payload[f.name] = v;
       });
@@ -1623,7 +1679,7 @@ function exportCsv(ent) {
   const lines = [headers.join(',')];
   rows.forEach(row => {
     const line = ent.fields.map(f => {
-      let v = formatCell(f, row[f.name]);
+      let v = f.type === 'checkbox' ? (row[f.name] === true ? 'Yes' : 'No') : formatCell(f, row[f.name]);
       v = String(v).replace(/"/g, '""');
       return `"${v}"`;
     });
