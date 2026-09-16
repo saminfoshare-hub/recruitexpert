@@ -51,7 +51,7 @@ window.ENTITIES = [
     group: "Core", displayField: "CATEGORY", search: ["CATEGORY", "EMPID"], agencyField: "AgencyID",
     printReports: ["Demand Letter", "Permission Exp", "Permission Letter", "Undertaking Permission", "Exp Trade"],
     fields: [
- { name: "SELECT", label: "Select", type: "staticselect", options: ["True", "False"] },
+ { name: "SELECT", label: "Select", type: "checkbox" },
    { name: "EMPID", label: "Empid", type: "select", ref: "employer" },
        { name: "CATEGORY", label: "Category", type: "text", required: true },
       { name: "CATEGORYARBIC", label: "Categoryarbic", type: "text" },
@@ -66,7 +66,7 @@ window.ENTITIES = [
     key: "employer", table: "EMPLOYER", pk: "EMPID", label: "Employers", icon: "fa-briefcase",
     group: "Core", displayField: "NAMEOFEMPLOYER", search: ["NAMEOFEMPLOYER", "VISANO"], agencyField: "AGENCYID",
     fields: [
-	{ name: "ACTIVE", label: "Active", type: "staticselect", options: ["True", "False"] },
+	{ name: "ACTIVE", label: "Active", type: "checkbox", defaultValue: true },
  	{ name: "ENTRYDATE", label: "Entrydate", type: "text" },
       { name: "FILENO", label: "Fileno", type: "text" },
       { name: "NAMEOFEMPLOYER", label: "Nameofemployer", type: "text", required: true },
