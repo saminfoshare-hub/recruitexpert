@@ -8,16 +8,29 @@ const sb = backendReady ? window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUP
 const root = document.getElementById('root');
 let currentUser = null;        // matched row from tbl_User after login
 
-// tbl_User.Permission is a free-text column ("Admin" / "User"), so this is
-// deliberately tolerant of case. Anyone with no Permission value set at all
-// (every account created before this existed) is treated as Admin — an
-// existing account should keep working exactly as it did before this was
-// added, not suddenly get locked out. Only an explicit non-"admin" value
-// (i.e. "User") is restricted.
+// tbl_User.Permission is a free-text column ("Admin" / "User" / "Developer"),
+// so this is deliberately tolerant of case. Anyone with no Permission value
+// set at all (every account created before this existed) is treated as the
+// most permissive tier (Admin/Developer) — an existing account should keep
+// working exactly as it did before this was added, not suddenly get locked
+// out. Only an explicit "User" value is restricted.
+//
+// isAdmin(): can add/edit/delete data records (candidates, employers,
+// categories, ledger entries, etc). True for Admin and Developer.
 function isAdmin() {
   if (!currentUser) return false;
   const p = String(currentUser.Permission ?? '').trim().toLowerCase();
-  return p === '' || p === 'admin';
+  return p === '' || p === 'admin' || p === 'developer';
+}
+// isDeveloper(): the three admin-tool tabs (Reports, User Accounts,
+// Companies) — a narrower group than isAdmin() above. Admin can add/edit/
+// delete data but does NOT get these; only Developer (and legacy blank-
+// Permission accounts, same backward-compatibility reasoning as isAdmin())
+// does.
+function isDeveloper() {
+  if (!currentUser) return false;
+  const p = String(currentUser.Permission ?? '').trim().toLowerCase();
+  return p === '' || p === 'developer';
 }
 let currentAgencyId = null;    // AGENCYID chosen at login — every query is scoped to this
 let currentAgencyName = '';
@@ -578,15 +591,20 @@ function renderShell() {
     el('div', { class: 'sidebar-item', 'data-key': 'searchform', onclick: () => selectEntity('searchform') }, [
       el('i', { class: 'fa-solid fa-magnifying-glass-chart' }), 'Search Candidates',
     ]),
-    // Reports, User Accounts, and Companies are hidden from restricted
-    // ("User" permission) accounts — visible only to Admin. See isAdmin()
-    // above.
-    ...(isAdmin() ? [el('div', { class: 'sidebar-item', 'data-key': 'reports', onclick: () => selectEntity('reports') }, [
+    // Reports, User Accounts, and Companies are visible only to Developer —
+    // Admin can add/edit/delete data but doesn't get these three. Same
+    // reasoning for Receivables, Transactions, and Accounts below. Visa
+    // Expenses is hidden from every role, Developer included — see
+    // isDeveloper() above.
+    ...(isDeveloper() ? [el('div', { class: 'sidebar-item', 'data-key': 'reports', onclick: () => selectEntity('reports') }, [
       el('i', { class: 'fa-solid fa-file-lines' }), 'Reports',
     ])] : []),
     ...groups.flatMap(g => [
       el('div', { class: 'sidebar-group-label' }, g),
-      ...window.ENTITIES.filter(e => e.group === g && (isAdmin() || (e.key !== 'tbl_user' && e.key !== 'company'))).map(e =>
+      ...window.ENTITIES.filter(e =>
+        e.group === g && e.key !== 'visaexpense' &&
+        (isDeveloper() || !['tbl_user', 'company', 'receivable', 'transition', 'account'].includes(e.key))
+      ).map(e =>
         el('div', { class: 'sidebar-item', 'data-key': e.key, onclick: () => selectEntity(e.key) }, [
           el('i', { class: `fa-solid ${e.icon}` }), e.label,
         ])
@@ -626,14 +644,20 @@ async function selectEntity(key) {
   if (key === 'dashboard') { await showDashboard(); return; }
   if (key === 'searchform') { await renderSearchForm(); return; }
   if (key === 'reports') {
-    if (!isAdmin()) { toast('Reports is only available to Admin accounts.'); await showDashboard(); return; }
+    if (!isDeveloper()) { toast('Reports is only available to Developer accounts.'); await showDashboard(); return; }
     await renderReportsList(); return;
   }
-  if (key === 'tbl_user' && !isAdmin()) {
-    toast('User Accounts is only available to Admin accounts.'); await showDashboard(); return;
+  if (key === 'tbl_user' && !isDeveloper()) {
+    toast('User Accounts is only available to Developer accounts.'); await showDashboard(); return;
   }
-  if (key === 'company' && !isAdmin()) {
-    toast('Companies is only available to Admin accounts.'); await showDashboard(); return;
+  if (key === 'company' && !isDeveloper()) {
+    toast('Companies is only available to Developer accounts.'); await showDashboard(); return;
+  }
+  if (['receivable', 'transition', 'account'].includes(key) && !isDeveloper()) {
+    toast('This section is only available to Developer accounts.'); await showDashboard(); return;
+  }
+  if (key === 'visaexpense') {
+    toast('Visa Expenses is no longer available.'); await showDashboard(); return;
   }
   const ent = entityByKey(key);
   document.getElementById('pageTitle').textContent = ent.label;
@@ -1650,6 +1674,32 @@ async function openForm(ent, existingRow) {
       // employer rather than whatever was saved historically).
       applyCategoryAutofill(inputs.CATEGORYID.value);
     }
+
+    // Status auto-set: Visastamped/FSANo/FSADate/Traveldate each imply a
+    // specific Status. Checked most-advanced-stage-first (Traveled is
+    // further along than merely Stamped) so that whichever stage the
+    // candidate has actually reached wins if more than one of the four
+    // happens to be filled in. Wired as live listeners on those four
+    // fields only — opening an old record and editing something unrelated
+    // never touches its Status; it only changes here while you're
+    // actually editing one of these four during this session, otherwise
+    // Status stays exactly whatever was selected before.
+    if (inputs.STATUS) {
+      const STATUS_AUTO_RULES = [
+        ['TRAVELDATE', 'Traveled'],
+        ['FSADate', 'FSA Regestered'], // matches the exact (misspelled) option in entities.js
+        ['FSANo', 'FSA Pending'],
+        ['VISASTAMPED', 'Stamped'],
+      ];
+      const recomputeStatus = () => {
+        const hit = STATUS_AUTO_RULES.find(([fieldName]) =>
+          inputs[fieldName] && String(inputs[fieldName].value ?? '').trim() !== '');
+        if (hit) inputs.STATUS.value = hit[1];
+      };
+      STATUS_AUTO_RULES.forEach(([fieldName]) => {
+        if (inputs[fieldName]) inputs[fieldName].addEventListener('input', recomputeStatus);
+      });
+    }
   }
 
   if (ent.key === 'employer') {
@@ -1934,6 +1984,28 @@ async function openForm(ent, existingRow) {
         payload[f.name] = v;
       });
       if (!valid) { errBox.textContent = 'Please fill all required fields.'; return; }
+
+      // Enumber must be unique across DATATABLE. This checks against
+      // whatever's currently cached client-side, which is enough to catch
+      // the normal case (someone re-typing/pasting a number already used)
+      // and give an immediate, specific error instead of a generic DB
+      // failure — but two people saving the same new Enumber at almost the
+      // same moment could still both pass this check. A UNIQUE constraint
+      // on DATATABLE."Enumber" in Postgres is the real guarantee; this is
+      // just the friendly front-line check.
+      if (ent.key === 'datatable') {
+        const newEnumber = String(payload.Enumber ?? '').trim();
+        if (newEnumber !== '') {
+          const dup = (cache[ent.table] || []).some(r =>
+            (!existingRow || String(r[ent.pk]) !== String(existingRow[ent.pk])) &&
+            String(r.Enumber ?? '').trim().toLowerCase() === newEnumber.toLowerCase()
+          );
+          if (dup) {
+            errBox.textContent = `Enumber "${payload.Enumber}" is already used by another record — Enumber must be unique.`;
+            return;
+          }
+        }
+      }
 
       saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
       let result;
@@ -2530,7 +2602,7 @@ function renderReportDesigner(existingReport) {
   // — so it needs its own guard rather than relying only on the tab being
   // hidden. Printing an EXISTING report (openReportPrintPicker) is
   // deliberately NOT gated here — read-only accounts can still print.
-  if (!isAdmin()) { toast('Designing reports requires an Admin account.'); return; }
+  if (!isDeveloper()) { toast('Designing reports requires a Developer account.'); return; }
   document.getElementById('pageTitle').textContent = (existingReport && existingReport.id) ? `Edit Report: ${existingReport.name}` : 'New Report';
   const content = document.getElementById('content');
   content.innerHTML = '';
@@ -3080,7 +3152,7 @@ function openVisaFormKhi() {
   const reports = loadSavedReports();
   const match = reports.find(r => /visa\s*form\s*(karachi|khi)/i.test(r.name));
   if (match) { openReportPrintPicker(match); return; }
-  if (!isAdmin()) { toast('No "Visa Form Karachi" report has been designed yet — ask an Admin to design it.'); return; }
+  if (!isDeveloper()) { toast('No "Visa Form Karachi" report has been designed yet — ask a Developer to design it.'); return; }
   if (confirm('No "Visa Form Karachi" report has been designed yet. Design it now?')) {
     renderReportDesigner({ id: null, name: 'Visa Form Karachi', elements: [] });
   }
@@ -3091,7 +3163,7 @@ function openVisaFormIsb() {
   const reports = loadSavedReports();
   const match = reports.find(r => /visa\s*form\s*(islamabad|isb)/i.test(r.name));
   if (match) { openReportPrintPicker(match); return; }
-  if (!isAdmin()) { toast('No "Visa Form ISB" report has been designed yet — ask an Admin to design it.'); return; }
+  if (!isDeveloper()) { toast('No "Visa Form ISB" report has been designed yet — ask a Developer to design it.'); return; }
   if (confirm('No "Visa Form ISB" report has been designed yet. Design it now?')) {
     renderReportDesigner({ id: null, name: 'Visa Form ISB', elements: [] });
   }
