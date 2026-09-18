@@ -578,14 +578,15 @@ function renderShell() {
     el('div', { class: 'sidebar-item', 'data-key': 'searchform', onclick: () => selectEntity('searchform') }, [
       el('i', { class: 'fa-solid fa-magnifying-glass-chart' }), 'Search Candidates',
     ]),
-    // Reports, User Accounts, and Companies are hidden from Admin accounts
-    // specifically (shown to everyone else) — see isAdmin() above.
-    ...(!isAdmin() ? [el('div', { class: 'sidebar-item', 'data-key': 'reports', onclick: () => selectEntity('reports') }, [
+    // Reports, User Accounts, and Companies are hidden from restricted
+    // ("User" permission) accounts — visible only to Admin. See isAdmin()
+    // above.
+    ...(isAdmin() ? [el('div', { class: 'sidebar-item', 'data-key': 'reports', onclick: () => selectEntity('reports') }, [
       el('i', { class: 'fa-solid fa-file-lines' }), 'Reports',
     ])] : []),
     ...groups.flatMap(g => [
       el('div', { class: 'sidebar-group-label' }, g),
-      ...window.ENTITIES.filter(e => e.group === g && (!isAdmin() || (e.key !== 'tbl_user' && e.key !== 'company'))).map(e =>
+      ...window.ENTITIES.filter(e => e.group === g && (isAdmin() || (e.key !== 'tbl_user' && e.key !== 'company'))).map(e =>
         el('div', { class: 'sidebar-item', 'data-key': e.key, onclick: () => selectEntity(e.key) }, [
           el('i', { class: `fa-solid ${e.icon}` }), e.label,
         ])
@@ -625,14 +626,14 @@ async function selectEntity(key) {
   if (key === 'dashboard') { await showDashboard(); return; }
   if (key === 'searchform') { await renderSearchForm(); return; }
   if (key === 'reports') {
-    if (isAdmin()) { toast('Reports is not available to Admin accounts.'); await showDashboard(); return; }
+    if (!isAdmin()) { toast('Reports is only available to Admin accounts.'); await showDashboard(); return; }
     await renderReportsList(); return;
   }
-  if (key === 'tbl_user' && isAdmin()) {
-    toast('User Accounts is not available to Admin accounts.'); await showDashboard(); return;
+  if (key === 'tbl_user' && !isAdmin()) {
+    toast('User Accounts is only available to Admin accounts.'); await showDashboard(); return;
   }
-  if (key === 'company' && isAdmin()) {
-    toast('Companies is not available to Admin accounts.'); await showDashboard(); return;
+  if (key === 'company' && !isAdmin()) {
+    toast('Companies is only available to Admin accounts.'); await showDashboard(); return;
   }
   const ent = entityByKey(key);
   document.getElementById('pageTitle').textContent = ent.label;
@@ -2522,6 +2523,14 @@ async function renderPdfFirstPageToDataUrl(arrayBuffer) {
 }
 
 function renderReportDesigner(existingReport) {
+  // Same choke-point pattern as openForm's isAdmin() guard: the "Reports"
+  // sidebar tab is hidden from non-Admin accounts, but the "Visa Form
+  // KHI"/"Visa Form ISB" shortcut buttons can still reach this function
+  // directly (their fallback for when that named report doesn't exist yet)
+  // — so it needs its own guard rather than relying only on the tab being
+  // hidden. Printing an EXISTING report (openReportPrintPicker) is
+  // deliberately NOT gated here — read-only accounts can still print.
+  if (!isAdmin()) { toast('Designing reports requires an Admin account.'); return; }
   document.getElementById('pageTitle').textContent = (existingReport && existingReport.id) ? `Edit Report: ${existingReport.name}` : 'New Report';
   const content = document.getElementById('content');
   content.innerHTML = '';
@@ -2540,11 +2549,15 @@ function renderReportDesigner(existingReport) {
 
   const empEnt = entityByKey('employer');
   const catEnt = entityByKey('category');
+  const alEnt = entityByKey('agentledger');
+  const elEnt = entityByKey('employerledger');
   const fieldSelect = el('select', {}, [
     el('option', { value: '' }, '— Add a field —'),
     el('optgroup', { label: 'Candidate (DATATABLE)' }, dtEnt.fields.map(f => el('option', { value: f.name }, f.label))),
     el('optgroup', { label: 'Employer' }, empEnt.fields.map(f => el('option', { value: `EMPLOYER.${f.name}` }, f.label))),
     el('optgroup', { label: 'Category' }, catEnt.fields.map(f => el('option', { value: `CATEGORY.${f.name}` }, f.label))),
+    el('optgroup', { label: 'Agent Ledger' }, alEnt.fields.map(f => el('option', { value: `AGENTLEDGER.${f.name}` }, f.label))),
+    el('optgroup', { label: 'Employer Ledger' }, elEnt.fields.map(f => el('option', { value: `EMPLOYERLEDGER.${f.name}` }, f.label))),
   ]);
   // Same idea as fieldSelect, but drops a scannable Code128 barcode bound to
   // the chosen field instead of plain text — e.g. Enumber or Visano so the
@@ -2584,6 +2597,12 @@ function renderReportDesigner(existingReport) {
     } else if (name.startsWith('CATEGORY.')) {
       const f = catEnt.fields.find(x => x.name === name.slice('CATEGORY.'.length));
       label = f ? `Category: ${f.label}` : name;
+    } else if (name.startsWith('AGENTLEDGER.')) {
+      const f = alEnt.fields.find(x => x.name === name.slice('AGENTLEDGER.'.length));
+      label = f ? `Agent Ledger: ${f.label}` : name;
+    } else if (name.startsWith('EMPLOYERLEDGER.')) {
+      const f = elEnt.fields.find(x => x.name === name.slice('EMPLOYERLEDGER.'.length));
+      label = f ? `Employer Ledger: ${f.label}` : name;
     } else {
       const f = dtEnt.fields.find(x => x.name === name);
       label = f ? f.label : name;
@@ -2947,7 +2966,23 @@ async function openReportPrintPicker(report) {
   const dtEnt = entityByKey('datatable');
   const empEnt = entityByKey('employer');
   const catEnt = entityByKey('category');
+  const alEnt = entityByKey('agentledger');
+  const elEnt = entityByKey('employerledger');
   const candidates = [...(cache[dtEnt.table] || [])].sort((a, b) => (b.DID ?? 0) - (a.DID ?? 0));
+
+  // Agent Ledger / Employer Ledger aren't preloaded by preloadRefCaches
+  // (nothing else references them via a select field), and a ledger can run
+  // long, so these are fetched fresh here, most-recent-first, capped at 200
+  // rows — plenty to find a recent entry without pulling years of history
+  // into a dropdown.
+  const [{ data: agentLedgerRows }, { data: employerLedgerRows }] = await Promise.all([
+    sb.from(alEnt.table).select('*').order(alEnt.pk, { ascending: false }).limit(200),
+    sb.from(elEnt.table).select('*').order(elEnt.pk, { ascending: false }).limit(200),
+  ]);
+  const ledgerEntryLabel = (row) => {
+    const amount = row.DEBIT ? `Debit ${row.DEBIT}` : row.CREDIT ? `Credit ${row.CREDIT}` : '';
+    return [row.DATE, row.DESCRIPTION || '(no description)', amount].filter(Boolean).join(' — ');
+  };
 
   // Employer and Candidate are two independent ways to print — picking
   // either one is enough on its own. Printing straight from Employer has no
@@ -2983,6 +3018,14 @@ async function openReportPrintPicker(report) {
     el('option', { value: '' }, '— none —'),
     ...candidates.map(c => el('option', { value: String(c[dtEnt.pk]) }, `${c.NAME || '(no name)'}${c.PASSPORTNO ? ' — ' + c.PASSPORTNO : ''}`)),
   ]);
+  const agentLedgerSelect = el('select', { style: 'width:100%' }, [
+    el('option', { value: '' }, '— none —'),
+    ...(agentLedgerRows || []).map(r => el('option', { value: String(r[alEnt.pk]) }, ledgerEntryLabel(r))),
+  ]);
+  const employerLedgerSelect = el('select', { style: 'width:100%' }, [
+    el('option', { value: '' }, '— none —'),
+    ...(employerLedgerRows || []).map(r => el('option', { value: String(r[elEnt.pk]) }, ledgerEntryLabel(r))),
+  ]);
 
   const overlay = el('div', { class: 'modal-overlay' }, [
     el('div', { class: 'modal-box', style: 'max-width:420px' }, [
@@ -2990,12 +3033,16 @@ async function openReportPrintPicker(report) {
       el('div', { class: 'f-field' }, [el('label', {}, 'Print for an Employer'), employerSelect]),
       el('div', { class: 'f-field' }, [el('label', {}, 'Which Category / demand?'), categorySelect]),
       el('div', { class: 'f-field' }, [el('label', {}, 'Or print for a Candidate'), candidateSelect]),
+      el('div', { class: 'f-field' }, [el('label', {}, 'Or print for an Agent Ledger entry'), agentLedgerSelect]),
+      el('div', { class: 'f-field' }, [el('label', {}, 'Or print for an Employer Ledger entry'), employerLedgerSelect]),
       el('div', { style: 'margin-top:16px;display:flex;justify-content:flex-end;gap:8px' }, [
         el('button', { class: 'btn btn-outline', onclick: () => overlay.remove() }, 'Cancel'),
         el('button', { class: 'btn btn-primary', onclick: () => {
           const candId = candidateSelect.value;
           const empId = employerSelect.value;
           const catId = categorySelect.value;
+          const agentLedgerId = agentLedgerSelect.value;
+          const employerLedgerId = employerLedgerSelect.value;
           if (candId) {
             const cand = candidates.find(c => String(c[dtEnt.pk]) === candId);
             overlay.remove();
@@ -3007,8 +3054,16 @@ async function openReportPrintPicker(report) {
             // still work correctly.
             overlay.remove();
             printReportForCandidate(report, { EMPID: empId, CATEGORYID: catId || undefined });
+          } else if (agentLedgerId) {
+            const row = (agentLedgerRows || []).find(r => String(r[alEnt.pk]) === agentLedgerId);
+            overlay.remove();
+            printReportForCandidate(report, row);
+          } else if (employerLedgerId) {
+            const row = (employerLedgerRows || []).find(r => String(r[elEnt.pk]) === employerLedgerId);
+            overlay.remove();
+            printReportForCandidate(report, row);
           } else {
-            toast('Pick an Employer or a Candidate first.');
+            toast('Pick an Employer, a Candidate, or a Ledger entry first.');
           }
         } }, 'Print'),
       ]),
@@ -3025,6 +3080,7 @@ function openVisaFormKhi() {
   const reports = loadSavedReports();
   const match = reports.find(r => /visa\s*form\s*(karachi|khi)/i.test(r.name));
   if (match) { openReportPrintPicker(match); return; }
+  if (!isAdmin()) { toast('No "Visa Form Karachi" report has been designed yet — ask an Admin to design it.'); return; }
   if (confirm('No "Visa Form Karachi" report has been designed yet. Design it now?')) {
     renderReportDesigner({ id: null, name: 'Visa Form Karachi', elements: [] });
   }
@@ -3035,6 +3091,7 @@ function openVisaFormIsb() {
   const reports = loadSavedReports();
   const match = reports.find(r => /visa\s*form\s*(islamabad|isb)/i.test(r.name));
   if (match) { openReportPrintPicker(match); return; }
+  if (!isAdmin()) { toast('No "Visa Form ISB" report has been designed yet — ask an Admin to design it.'); return; }
   if (confirm('No "Visa Form ISB" report has been designed yet. Design it now?')) {
     renderReportDesigner({ id: null, name: 'Visa Form ISB', elements: [] });
   }
@@ -3074,6 +3131,17 @@ function resolveFieldValue(candidate, fieldKey) {
     const name = fieldKey.slice('CATEGORY.'.length);
     const cat = findCategoryForCandidate();
     return cat ? cat[name] : '';
+  }
+  // Agent Ledger / Employer Ledger fields — unlike EMPLOYER./CATEGORY.
+  // above, these don't need a lookup: when a report is printed "for an
+  // Agent Ledger Entry" or "for an Employer Ledger Entry" (see the Print
+  // picker), the record handed to this function already IS that ledger
+  // row, so its own fields are read directly off it, prefix stripped.
+  if (fieldKey.startsWith('AGENTLEDGER.')) {
+    return candidate[fieldKey.slice('AGENTLEDGER.'.length)];
+  }
+  if (fieldKey.startsWith('EMPLOYERLEDGER.')) {
+    return candidate[fieldKey.slice('EMPLOYERLEDGER.'.length)];
   }
   return candidate[fieldKey];
 }
