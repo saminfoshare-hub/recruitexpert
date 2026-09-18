@@ -7,6 +7,18 @@ const sb = backendReady ? window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUP
 
 const root = document.getElementById('root');
 let currentUser = null;        // matched row from tbl_User after login
+
+// tbl_User.Permission is a free-text column ("Admin" / "User"), so this is
+// deliberately tolerant of case. Anyone with no Permission value set at all
+// (every account created before this existed) is treated as Admin — an
+// existing account should keep working exactly as it did before this was
+// added, not suddenly get locked out. Only an explicit non-"admin" value
+// (i.e. "User") is restricted.
+function isAdmin() {
+  if (!currentUser) return false;
+  const p = String(currentUser.Permission ?? '').trim().toLowerCase();
+  return p === '' || p === 'admin';
+}
 let currentAgencyId = null;    // AGENCYID chosen at login — every query is scoped to this
 let currentAgencyName = '';
 let currentEntityKey = 'dashboard';
@@ -27,6 +39,30 @@ let refCache = {};    // table -> {id: displayLabel} for FK dropdowns/labels
 // Tab" button below; does nothing if that extension isn't installed.
 document.addEventListener('re-ksa-pull-result', (e) => {
   const msgEl = document.getElementById('re-ksa-status-msg');
+  if (!msgEl) return;
+  const detail = e.detail || {};
+  msgEl.style.color = detail.ok ? '' : 'var(--danger)';
+  msgEl.textContent = detail.message || '';
+});
+
+// Mirror image of the KSA listener above, but for pushing OUT to the BEOE
+// (Bureau of Emigration & Overseas Employment) "oep-portal" emigrant
+// registration page instead of pulling IN from KSA's SmartForm. Fed by the
+// (optional) BEOE SmartForm Bridge browser extension's content-app.js in
+// response to the "Send to BEOE Tab" button below; does nothing if that
+// extension isn't installed.
+document.addEventListener('re-beoe-push-result', (e) => {
+  const msgEl = document.getElementById('re-beoe-status-msg');
+  if (!msgEl) return;
+  const detail = e.detail || {};
+  msgEl.style.color = detail.ok ? '' : 'var(--danger)';
+  msgEl.textContent = detail.message || '';
+});
+
+// Same again for the BEOE permission page, which is pushed from the
+// Employer form rather than the Candidate one.
+document.addEventListener('re-beoe-permission-push-result', (e) => {
+  const msgEl = document.getElementById('re-beoe-perm-status-msg');
   if (!msgEl) return;
   const detail = e.detail || {};
   msgEl.style.color = detail.ok ? '' : 'var(--danger)';
@@ -91,11 +127,69 @@ function formatNumber(n) {
 // as-is, except for the special token "__TODAY__", which becomes today's
 // date in dd/mm/yyyy — the same format these text date columns are shown
 // and typed in, so it round-trips through formatDateDMY/parseStoredDate.
+// Auto-transliteration for the Add Candidate / Add Employer forms below.
+// Uses Google Translate's public "gtx" endpoint — the same one many
+// no-signup translate widgets use. IMPORTANT CAVEAT: this is an unofficial,
+// undocumented endpoint, not the official paid Google Cloud Translation
+// API. It works with no API key or signup, which is why it's used here to
+// get this working immediately, but Google could rate-limit, change, or
+// block it without notice, and heavy production use of it isn't officially
+// sanctioned. If this ever starts failing silently, that's almost certainly
+// why — the fix at that point is to switch to the official Cloud
+// Translation API (or Microsoft Translator, which has a comparable free
+// tier), both of which need a real API key I'd wire in here in place of
+// this URL. Also worth knowing: this transliterates NAMES phonetically,
+// which Google Translate does reasonably well for proper nouns but not
+// perfectly — treat the result as a fillable draft, not a guaranteed-correct
+// value, which is why every use below only fills an EMPTY target field and
+// never overwrites something already typed.
+async function translateText(text, sourceLang, targetLang) {
+  const q = String(text || '').trim();
+  if (!q) return '';
+  try {
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=${targetLang}&dt=t&q=${encodeURIComponent(q)}`;
+    const res = await fetch(url);
+    if (!res.ok) return '';
+    const data = await res.json();
+    return (data[0] || []).map(chunk => chunk[0]).join('').trim();
+  } catch (e) {
+    console.error('Translation failed:', e);
+    return '';
+  }
+}
+
+// Wires an auto-fill: when sourceInput loses focus with new text, and
+// targetInput is still empty, translate sourceInput's value and drop it
+// into targetInput. Only runs for NEW records (existingRow is checked by
+// the caller before wiring this at all) — never for edits, so it can't
+// silently overwrite a real saved value.
+function wireAutoTranslate(sourceInput, targetInput, sourceLang, targetLang) {
+  if (!sourceInput || !targetInput) return;
+  let lastValue = '';
+  sourceInput.addEventListener('blur', async () => {
+    const val = sourceInput.value.trim();
+    if (!val || val === lastValue || targetInput.value.trim()) return;
+    lastValue = val;
+    const translated = await translateText(val, sourceLang, targetLang);
+    if (translated && !targetInput.value.trim()) {
+      targetInput.value = translated;
+      targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  });
+}
+
 function resolveDefaultValue(field) {
   if (field.defaultValue === undefined) return '';
   if (field.defaultValue === '__TODAY__') {
     const d = new Date();
-    return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    // A real <input type="date"> only accepts yyyy-mm-dd and silently shows
+    // nothing if handed anything else — so the format has to follow the
+    // field's type, not one fixed shape. Text fields keep dd/mm/yyyy, which
+    // is what the rest of this app stores and displays.
+    if (field.type === 'date') return `${d.getFullYear()}-${mm}-${dd}`;
+    return `${dd}/${mm}/${d.getFullYear()}`;
   }
   return field.defaultValue;
 }
@@ -484,12 +578,14 @@ function renderShell() {
     el('div', { class: 'sidebar-item', 'data-key': 'searchform', onclick: () => selectEntity('searchform') }, [
       el('i', { class: 'fa-solid fa-magnifying-glass-chart' }), 'Search Candidates',
     ]),
-    el('div', { class: 'sidebar-item', 'data-key': 'reports', onclick: () => selectEntity('reports') }, [
+    // Reports, User Accounts, and Companies are hidden from Admin accounts
+    // specifically (shown to everyone else) — see isAdmin() above.
+    ...(!isAdmin() ? [el('div', { class: 'sidebar-item', 'data-key': 'reports', onclick: () => selectEntity('reports') }, [
       el('i', { class: 'fa-solid fa-file-lines' }), 'Reports',
-    ]),
+    ])] : []),
     ...groups.flatMap(g => [
       el('div', { class: 'sidebar-group-label' }, g),
-      ...window.ENTITIES.filter(e => e.group === g).map(e =>
+      ...window.ENTITIES.filter(e => e.group === g && (!isAdmin() || (e.key !== 'tbl_user' && e.key !== 'company'))).map(e =>
         el('div', { class: 'sidebar-item', 'data-key': e.key, onclick: () => selectEntity(e.key) }, [
           el('i', { class: `fa-solid ${e.icon}` }), e.label,
         ])
@@ -528,7 +624,16 @@ async function selectEntity(key) {
   setActiveSidebar(key);
   if (key === 'dashboard') { await showDashboard(); return; }
   if (key === 'searchform') { await renderSearchForm(); return; }
-  if (key === 'reports') { await renderReportsList(); return; }
+  if (key === 'reports') {
+    if (isAdmin()) { toast('Reports is not available to Admin accounts.'); await showDashboard(); return; }
+    await renderReportsList(); return;
+  }
+  if (key === 'tbl_user' && isAdmin()) {
+    toast('User Accounts is not available to Admin accounts.'); await showDashboard(); return;
+  }
+  if (key === 'company' && isAdmin()) {
+    toast('Companies is not available to Admin accounts.'); await showDashboard(); return;
+  }
   const ent = entityByKey(key);
   document.getElementById('pageTitle').textContent = ent.label;
   await showEntityList(ent);
@@ -633,7 +738,9 @@ async function renderSearchForm() {
   // to pick anymore, rather than being pickable but always returning zero
   // matching candidates.
   const activeEmployers = (cache[employerEnt.table] || [])
-    .filter(r => String(r.ACTIVE ?? '').trim().toLowerCase() === 'true');
+    .filter(r => String(r.ACTIVE ?? '').trim().toLowerCase() === 'true')
+    // Most recently added employer first (highest EMPID = newest row).
+    .sort((a, b) => (b[employerEnt.pk] ?? 0) - (a[employerEnt.pk] ?? 0));
   const employerSelect = el('select', {}, [
     el('option', { value: '' }, '— Any Employer —'),
     ...activeEmployers.map(r => el('option', { value: r[employerEnt.pk] }, r[employerEnt.displayField] ?? `#${r[employerEnt.pk]}`)),
@@ -738,8 +845,9 @@ async function renderSearchForm() {
     selectedOnlyBtn.className = showOnlySelected ? 'btn btn-primary' : 'btn btn-outline';
     showAllBtn.className = showOnlySelected ? 'btn btn-outline' : 'btn btn-primary';
     let rows = (cache[dtEnt.table] || []).filter(matchesFilters);
-    // Match Supabase's own Table Editor order exactly: ascending by DID.
-    rows = [...rows].sort((a, b) => (a.DID ?? 0) - (b.DID ?? 0));
+    // Most recently added first (highest DID = newest row) — matches how
+    // the Category list already sorts, per request.
+    rows = [...rows].sort((a, b) => (b.DID ?? 0) - (a.DID ?? 0));
     if (!rows.length) {
       const msg = showOnlySelected && selectedIds.size === 0
         ? 'No rows are ticked yet — tick some rows, or press "Show All".'
@@ -787,10 +895,10 @@ async function renderSearchForm() {
       return el('tr', {}, [
         el('td', {}, rowCheckbox),
         ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name], dtEnt, row))),
-        el('td', {}, el('div', { class: 'row-actions' }, [
+        el('td', {}, el('div', { class: 'row-actions' }, isAdmin() ? [
           el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(dtEnt, row) }, 'Edit'),
           el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(dtEnt, row) }, 'Delete'),
-        ])),
+        ] : [el('span', { style: 'color:var(--text-mute);font-size:.78rem;' }, '—')])),
       ]);
     }));
     const table = el('table', { class: 'data-table' }, [thead, tbody]);
@@ -869,7 +977,9 @@ function renderEntityList(ent) {
     ...(ent.key === 'agentledger' || ent.key === 'employerledger'
       ? [
           el('button', { class: 'btn btn-outline', onclick: () => printLedgerReport(ent) }, [el('i', { class: 'fa-solid fa-print' }), ' Print Report']),
-          el('button', { class: 'btn btn-outline', onclick: () => renderDuplicatesPanel(ent) }, [el('i', { class: 'fa-solid fa-clone' }), ' Find Duplicate Entries']),
+          // Bulk-deletes duplicates — an edit/delete action, so Admin-only,
+          // same as the row-level Edit/Delete buttons and the Add button below.
+          ...(isAdmin() ? [el('button', { class: 'btn btn-outline', onclick: () => renderDuplicatesPanel(ent) }, [el('i', { class: 'fa-solid fa-clone' }), ' Find Duplicate Entries'])] : []),
         ]
       : []),
     ...(ent.key === 'datatable'
@@ -879,7 +989,8 @@ function renderEntityList(ent) {
         ]
       : []),
     el('button', { class: 'btn btn-outline', onclick: () => exportCsv(ent) }, [el('i', { class: 'fa-solid fa-download' }), ' Export Report (CSV)']),
-    el('button', { class: 'btn btn-primary', onclick: () => openForm(ent, null) }, [el('i', { class: 'fa-solid fa-plus' }), ` Add ${ent.label.replace(/s$/, '')}`]),
+    // Read-only accounts can search and print but not add records.
+    ...(isAdmin() ? [el('button', { class: 'btn btn-primary', onclick: () => openForm(ent, null) }, [el('i', { class: 'fa-solid fa-plus' }), ` Add ${ent.label.replace(/s$/, '')}`])] : []),
   ]);
   // Search row sits flush against the button row below it — no vertical
   // gap between them (was gap:12px).
@@ -1020,10 +1131,10 @@ function refreshEntityListBody(ent) {
     return el('tr', {}, [
       ...(hasPrintReports ? [el('td', {}, rowCheckbox)] : []),
       ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name], ent, row))),
-      el('td', {}, el('div', { class: 'row-actions' }, [
+      el('td', {}, el('div', { class: 'row-actions' }, isAdmin() ? [
         el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(ent, row) }, 'Edit'),
         el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(ent, row) }, 'Delete'),
-      ])),
+      ] : [el('span', { style: 'color:var(--text-mute);font-size:.78rem;' }, '—')])),
     ]);
   }));
   const table = el('table', { class: 'data-table' }, [thead, tbody]);
@@ -1083,9 +1194,10 @@ function pageBtn(p, current, onPageChange) {
 function formatCell(field, value, ent, row) {
   if (field.type === 'checkbox') {
     // Editable right here when we know which row/table to write back to
-    // (both list views pass this); falls back to a plain read-only box
-    // otherwise rather than erroring.
-    const canEdit = !!(ent && row);
+    // (both list views pass this) AND the account is Admin — this toggle
+    // writes straight to the database on click, bypassing openForm's own
+    // guard entirely, so it needs its own isAdmin() check.
+    const canEdit = !!(ent && row) && isAdmin();
     const cb = el('input', {
       type: 'checkbox',
       style: 'width:16px;height:16px;accent-color:#1a56db;vertical-align:middle;' + (canEdit ? 'cursor:pointer;' : 'cursor:default;'),
@@ -1109,6 +1221,11 @@ function formatCell(field, value, ent, row) {
     }
     return cb;
   }
+  // strUserPassword shows masked in the table too, not just the form —
+  // otherwise every password sits in plain text on the User Accounts list.
+  if (ent && ent.key === 'tbl_user' && field.name === 'strUserPassword') {
+    return (value === null || value === undefined || value === '') ? '—' : '••••••••';
+  }
   if (value === null || value === undefined || value === '') return '—';
   if (field.type === 'select') {
     const refEnt = entityByKey(field.ref);
@@ -1125,6 +1242,13 @@ function filteredRows(ent) {
   let rows = cache[ent.table] || [];
   // Match Supabase's own Table Editor order exactly: ascending by DID.
   if (ent.key === 'datatable') rows = [...rows].sort((a, b) => (a.DID ?? 0) - (b.DID ?? 0));
+  // Categories: grouped by employer, most recently added employer first
+  // (highest EMPID on top), and within the same employer, most recently
+  // added category first (CATEGORYID as the tiebreaker).
+  if (ent.key === 'category') {
+    rows = [...rows].sort((a, b) =>
+      ((b.EMPID ?? 0) - (a.EMPID ?? 0)) || ((b.CATEGORYID ?? 0) - (a.CATEGORYID ?? 0)));
+  }
   // NOTE: categories linked to an inactive employer used to be hidden here
   // too ("same rule as the dropdowns") — but that was quietly cutting the
   // Category list down to a fraction of what's actually in the table (28
@@ -1313,11 +1437,11 @@ const DATATABLE_FORM_SECTIONS = [
   {
     title: 'Candidate Details',
     fields: [
-      'NAME', 'FATHERSNAME', 'PASSPORTNO', 'DATEOFBIRTH', 'PLACEOFBIRTH',
+      'NAME', 'FATHERSNAME', 'ARBICNAME', 'ARBICFATHERNAME', 'PASSPORTNO', 'DATEOFBIRTH', 'PLACEOFBIRTH',
       'DATEOFISSUE', 'DATEOFEXPIRY', 'ADDRESS', 'COUNTRY', 'DISTRICT',
       'Enumber', 'SEX', 'MERITALSTATUS', 'RELIGION',
       'NIC', 'PLACEOFISSUE', 'Qualification',
-      'ARBICNAME', 'ARBICFATHERNAME', 'Select',
+       'Select',
       'SECT', 'NICISSUEDATE', 'STICKERNO', 'Mobile',
     ],
   },
@@ -1335,6 +1459,11 @@ const DATATABLE_FORM_SECTIONS = [
 ];
 
 async function openForm(ent, existingRow) {
+  // Read-only accounts (Permission != Admin) can search and print but never
+  // add/edit/delete — this is the single choke point every "Add"/"Edit"
+  // button below goes through, so guarding here covers all of them even if
+  // a button somewhere is missed.
+  if (!isAdmin()) { toast('Your account is read-only — adding and editing records requires an Admin account.'); return; }
   // make sure dropdown ref data is fresh
   await preloadRefCaches();
 
@@ -1375,7 +1504,19 @@ async function openForm(ent, existingRow) {
       const labelFn = CUSTOM_OPTION_LABELS[`${ent.key}.${f.name}`];
       const options = [el('option', { value: '' }, '— none —')];
       const currentVal = val != null ? String(val) : '';
-      (cache[refEnt.table] || []).forEach(r => {
+      // Employer picker: most recently added first (highest EMPID on top).
+      // Category picker (e.g. DATATABLE's Categoryid dropdown): grouped by
+      // employer the same way the Category list now is — most recently
+      // added employer's categories on top, newest category within that
+      // employer first.
+      let refRows = cache[refEnt.table] || [];
+      if (refEnt.key === 'employer') {
+        refRows = [...refRows].sort((a, b) => (b[refEnt.pk] ?? 0) - (a[refEnt.pk] ?? 0));
+      } else if (refEnt.key === 'category') {
+        refRows = [...refRows].sort((a, b) =>
+          ((b.EMPID ?? 0) - (a.EMPID ?? 0)) || ((b.CATEGORYID ?? 0) - (a.CATEGORYID ?? 0)));
+      }
+      refRows.forEach(r => {
         // Don't offer an inactive employer as a choice — but if this record
         // is already pointing at one (e.g. it was set before the employer
         // was deactivated), keep showing it so editing doesn't silently
@@ -1391,7 +1532,12 @@ async function openForm(ent, existingRow) {
       inputEl.value = isAgencyField ? String(currentAgencyId ?? '') : (val ?? '');
       if (isAgencyField) inputEl.disabled = true;
     } else {
-      inputEl = el('input', { type: f.type === 'number' ? 'number' : f.type === 'date' ? 'date' : 'text' });
+      // strUserPassword masks like a real password field — everything else
+      // in this generic renderer is untouched.
+      const inputType = (ent.key === 'tbl_user' && f.name === 'strUserPassword')
+        ? 'password'
+        : (f.type === 'number' ? 'number' : f.type === 'date' ? 'date' : 'text');
+      inputEl = el('input', { type: inputType });
       if (f.type === 'number') inputEl.step = 'any';
       inputEl.value = val ?? '';
     }
@@ -1408,6 +1554,20 @@ async function openForm(ent, existingRow) {
     fieldNodesByName[f.name] = node;
     return node;
   });
+
+  // Auto-transliteration, Add mode only (never on an edit — see
+  // wireAutoTranslate's own comment for why): typing a Name/Father's Name
+  // and tabbing out fills the matching Arabic field if it's still empty;
+  // typing an Arabic company name does the same into Name of Employer.
+  if (!existingRow) {
+    if (ent.key === 'datatable') {
+      wireAutoTranslate(inputs.NAME, inputs.ARBICNAME, 'en', 'ur');
+      wireAutoTranslate(inputs.FATHERSNAME, inputs.ARBICFATHERNAME, 'en', 'ur');
+    }
+    if (ent.key === 'employer') {
+      wireAutoTranslate(inputs.ARBICCOMPANY, inputs.NAMEOFEMPLOYER, 'ar', 'en');
+    }
+  }
 
   // Section headings + a wider grid (repeat(auto-fill, minmax(...))) so more
   // fields sit side by side on a wide screen instead of stacking in one
@@ -1507,9 +1667,13 @@ async function openForm(ent, existingRow) {
   // when clicked. Nothing is read from any other tab automatically; this
   // just asks the (optional) KSA SmartForm Bridge browser extension to
   // look at whatever visa.mofa.gov.sa tab you currently have open and,
-  // if it finds one, report back what's on it right now.
+  // if it finds one, report back what's on it right now. Available on both
+  // the DATATABLE (candidate) and EMPLOYER forms — the extension itself
+  // figures out which one applies to based on the fields it finds on the
+  // page, and content-app.js only fills whichever of those two forms is
+  // actually open right now.
   let ksaPullBlock = null;
-  if (ent.key === 'datatable' && !existingRow) {
+  if ((ent.key === 'datatable' || ent.key === 'employer') && !existingRow) {
     const ksaStatusMsg = el('div', { id: 're-ksa-status-msg', style: 'font-size:.78rem;color:var(--text-mute);margin-top:6px;' }, '');
     const ksaBtn = el('button', {
       type: 'button', class: 'btn btn-outline btn-sm',
@@ -1525,16 +1689,211 @@ async function openForm(ent, existingRow) {
       },
     }, [el('i', { class: 'fa-solid fa-arrows-rotate' }), ' Get Data from KSA Tab']);
 
+    const ksaDescription = ent.key === 'employer'
+      ? 'Requires the KSA SmartForm Bridge browser extension and an open visa.mofa.gov.sa/Enjaz/ViewVisaDetails/Org tab. Click to read that tab\'s Visa Issued Number / Residence-National ID Number / Visa Date / Full Name / Visa Issuing Authority / Person Count into this form (into Visa No / ID No / Visa Date / Arbiccompany / Embassyin / Demand) — nothing is read until you click.'
+      : 'Requires the KSA SmartForm Bridge browser extension and an open visa.mofa.gov.sa tab. Click to read that tab\'s Name / Father\'s Name / Passport No / Date of Birth / Place of Birth / Date of Issue / Date of Expiry / ID Number / Place of Issue / Home Address / District / Marital Status / Sex / Qualification fields into this form — nothing is read until you click.';
+
     ksaPullBlock = el('div', {
       class: 'f-field full',
       style: 'background:var(--bg);border:1px dashed var(--border);border-radius:8px;padding:12px 14px;margin-bottom:6px;',
     }, [
       el('label', {}, 'Get Data from KSA Tab (optional)'),
-      el('div', { style: 'font-size:.78rem;color:var(--text-mute);margin-bottom:8px;' },
-        'Requires the KSA SmartForm Bridge browser extension and an open visa.mofa.gov.sa tab. Click to read that tab\'s Name / Father\'s Name / Passport No / Date of Birth / Place of Birth / Date of Issue / Date of Expiry / ID Number / Place of Issue / Home Address / District / Marital Status / Sex / Qualification fields into this form — nothing is read until you click.'),
+      el('div', { style: 'font-size:.78rem;color:var(--text-mute);margin-bottom:8px;' }, ksaDescription),
       ksaBtn,
       ksaStatusMsg,
     ]);
+  }
+
+  // "Send to BEOE Tab" — the reverse direction of the KSA block above: this
+  // form's data going OUT to the BEOE (Bureau of Emigration & Overseas
+  // Employment) oep-portal Emigrant Registration page, instead of another
+  // site's data coming IN. Available whenever the DATATABLE form is open
+  // (Add or Edit) — it reads whatever is currently typed into the fields
+  // right now, so you don't need to save first. Like the KSA block, this
+  // depends on a browser extension (a "BEOE SmartForm Bridge", not yet
+  // built) doing the actual work of finding beoe.gov.pk's specific form
+  // fields and filling them; this app only ever hands over this
+  // candidate's data using DATATABLE's own field names; it has no
+  // knowledge of BEOE's page structure and never touches that page
+  // directly (a plain web page can't reach into a different site's tab —
+  // only a browser extension can bridge the two safely).
+  let beoePushBlock = null;
+  if (ent.key === 'datatable') {
+    const beoeStatusMsg = el('div', { id: 're-beoe-status-msg', style: 'font-size:.78rem;color:var(--text-mute);margin-top:6px;' }, '');
+    const beoeBtn = el('button', {
+      type: 'button', class: 'btn btn-outline btn-sm',
+      onclick: () => {
+        if (document.body.getAttribute('data-re-beoe-bridge') !== 'ready') {
+          beoeStatusMsg.style.color = 'var(--danger)';
+          beoeStatusMsg.textContent = "The BEOE SmartForm Bridge extension isn't installed or enabled in this browser.";
+          return;
+        }
+        const liveData = {};
+        ent.fields.forEach(f => {
+          const inp = inputs[f.name];
+          if (!inp) return;
+          liveData[f.name] = f.type === 'checkbox' ? inp.checked : inp.value;
+        });
+        beoeStatusMsg.style.color = '';
+        beoeStatusMsg.textContent = 'Sending to the open BEOE Emigrant Registration tab…';
+        document.dispatchEvent(new CustomEvent('re-beoe-push-request', { detail: { candidate: liveData } }));
+      },
+    }, [el('i', { class: 'fa-solid fa-paper-plane' }), ' Send to BEOE Tab']);
+    const beoeOpenLink = el('a', {
+      href: 'https://beoe.gov.pk/oep-portal/emigrant-registrations/create',
+      target: '_blank', rel: 'noopener', class: 'btn btn-outline btn-sm',
+    }, [el('i', { class: 'fa-solid fa-up-right-from-square' }), ' Open BEOE Registration Page']);
+
+    beoePushBlock = el('div', {
+      class: 'f-field full',
+      style: 'background:var(--bg);border:1px dashed var(--border);border-radius:8px;padding:12px 14px;margin-bottom:6px;',
+    }, [
+      el('label', {}, 'Send to BEOE Portal (optional)'),
+      el('div', { style: 'font-size:.78rem;color:var(--text-mute);margin-bottom:8px;' },
+        "Requires the BEOE SmartForm Bridge browser extension and an open beoe.gov.pk Emigrant Registration tab (log in first). Sends this candidate's current field values across for that extension to fill in — nothing is sent until you click."),
+      el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' }, [beoeOpenLink, beoeBtn]),
+      beoeStatusMsg,
+    ]);
+  }
+
+  // "Send to BEOE Permission Tab" — the Employer/Category counterpart of
+  // the candidate block above, aimed at beoe.gov.pk's permissions/create
+  // page (Foreign Employer details + one repeating job block per trade
+  // category). Sends the employer's field values plus the CATEGORY rows
+  // linked to it; the extension clicks "Add Another Job" as needed so a
+  // second, third, ... category lands in its own block.
+  //
+  // Shown on BOTH the Employer form and the Category form, since either is
+  // a natural place to reach for it. From a Category, the employer sent is
+  // the one that category belongs to, and its sibling categories come along
+  // too — the BEOE page takes all trades for one permission in one go, so
+  // sending a lone category would mean re-doing the employer header by hand
+  // for every trade.
+  //
+  // The block always renders on those two forms, even when it can't send
+  // yet (unsaved record, or no employer picked). An explanation the user
+  // can read beats a button that silently isn't there.
+  let beoePermBlock = null;
+  if (ent.key === 'employer' || ent.key === 'category') {
+    const catEnt = entityByKey('category');
+    const empEnt = entityByKey('employer');
+
+    // Which employer this send is about, and where its details come from:
+    //  - On the Employer form it's this record, and we use the LIVE field
+    //    values so unsaved edits are included.
+    //  - On the Category form it's whichever employer the EMPID dropdown
+    //    currently points at, read from the saved EMPLOYER row.
+    let empId = null;
+    let blocker = '';
+    if (ent.key === 'employer') {
+      empId = existingRow ? existingRow[ent.pk] : null;
+      if (!empId) blocker = 'Save this employer first, then reopen it — categories are linked by employer ID, which only exists once the record is saved.';
+    } else {
+      empId = (inputs.EMPID && inputs.EMPID.value) || (existingRow ? existingRow.EMPID : null) || null;
+      if (!empId) blocker = 'Pick an Employer for this category first — the BEOE permission needs the employer details too.';
+    }
+
+    const getEmployerData = () => {
+      if (ent.key === 'employer') {
+        const live = {};
+        ent.fields.forEach(f => {
+          const inp = inputs[f.name];
+          if (!inp) return;
+          live[f.name] = f.type === 'checkbox' ? inp.checked : inp.value;
+        });
+        return live;
+      }
+      const id = (inputs.EMPID && inputs.EMPID.value) || (existingRow ? existingRow.EMPID : null);
+      return (cache[empEnt.table] || []).find(e => String(e[empEnt.pk]) === String(id)) || {};
+    };
+
+    // All categories for that employer, minus any explicitly marked
+    // Select = False. Rows that never had the flag set are included, so this
+    // behaves sensibly whether or not you use that flag.
+    //
+    // Fetched FRESH from Supabase at click time rather than read from the
+    // client-side `cache` — that cache can hold a partial or stale set of
+    // CATEGORY rows (e.g. whatever a list page last loaded/filtered/paged
+    // to), so trusting it here was silently sending only 1 of a real 4
+    // categories. A direct query is the only way to guarantee every
+    // category for this employer actually gets included.
+    const getCategories = async () => {
+      const id = ent.key === 'employer'
+        ? empId
+        : ((inputs.EMPID && inputs.EMPID.value) || (existingRow ? existingRow.EMPID : null));
+      if (!id) return [];
+      const { data, error } = await sb.from(catEnt.table).select('*').eq('EMPID', id);
+      if (error) {
+        console.error('Fetching categories for BEOE send failed:', error);
+        return [];
+      }
+      const rows = (data || []).filter(c =>
+        String(c.SELECT ?? '').trim().toLowerCase() !== 'false');
+      // On the Category form, the row being edited should go over with
+      // whatever is typed right now rather than its last saved values.
+      if (ent.key === 'category') {
+        const live = {};
+        ent.fields.forEach(f => {
+          const inp = inputs[f.name];
+          if (!inp) return;
+          live[f.name] = f.type === 'checkbox' ? inp.checked : inp.value;
+        });
+        const thisId = existingRow ? existingRow[ent.pk] : null;
+        const idx = thisId == null ? -1 : rows.findIndex(r => String(r[catEnt.pk]) === String(thisId));
+        if (idx >= 0) rows[idx] = { ...rows[idx], ...live };
+        else if (String(live.SELECT ?? '').trim().toLowerCase() !== 'false') rows.push(live);
+      }
+      return rows;
+    };
+
+    const permStatusMsg = el('div', { id: 're-beoe-perm-status-msg', style: 'font-size:.78rem;color:var(--text-mute);margin-top:6px;' }, '');
+    const permBtn = el('button', {
+      type: 'button', class: 'btn btn-outline btn-sm',
+      onclick: async () => {
+        if (blocker) {
+          permStatusMsg.style.color = 'var(--danger)';
+          permStatusMsg.textContent = blocker;
+          return;
+        }
+        if (document.body.getAttribute('data-re-beoe-bridge') !== 'ready') {
+          permStatusMsg.style.color = 'var(--danger)';
+          permStatusMsg.textContent = "The BEOE SmartForm Bridge extension isn't installed or enabled in this browser.";
+          return;
+        }
+        permStatusMsg.style.color = '';
+        permStatusMsg.textContent = 'Looking up this employer\u2019s categories\u2026';
+        const cats = await getCategories();
+        if (!cats.length) {
+          permStatusMsg.style.color = 'var(--danger)';
+          permStatusMsg.textContent = 'No categories found for this employer — add at least one on the Categories page first (or check none are set to Select = False).';
+          return;
+        }
+        permStatusMsg.style.color = '';
+        permStatusMsg.textContent = `Sending employer + ${cats.length} categor${cats.length === 1 ? 'y' : 'ies'} to the open BEOE permission tab…`;
+        document.dispatchEvent(new CustomEvent('re-beoe-permission-push-request', {
+          detail: { employer: getEmployerData(), categories: cats },
+        }));
+      },
+    }, [el('i', { class: 'fa-solid fa-paper-plane' }), ' Send to BEOE Permission Tab']);
+    const permOpenLink = el('a', {
+      href: 'https://beoe.gov.pk/oep-portal/permissions/create?permission_type=3',
+      target: '_blank', rel: 'noopener', class: 'btn btn-outline btn-sm',
+    }, [el('i', { class: 'fa-solid fa-up-right-from-square' }), ' Open BEOE Permission Page']);
+
+    beoePermBlock = el('div', {
+      class: 'f-field full',
+      style: 'background:var(--bg);border:1px dashed var(--border);border-radius:8px;padding:12px 14px;margin-bottom:6px;',
+    }, [
+      el('label', {}, 'Send to BEOE Permission Page (optional)'),
+      el('div', { style: 'font-size:.78rem;color:var(--text-mute);margin-bottom:8px;' },
+        "Requires the BEOE SmartForm Bridge extension and an open beoe.gov.pk permission tab (log in first). Sends the employer plus every category linked to it, adding a job block for each. Country/Place of Duty/Currency/Contract Period/Hours/Overtime/Experience go over as fixed standard values; Demand Letter No., Power of Attorney No. and Focal Person are repurposed from the closest Employer fields (Visa No., ID No., Name of Owner). Employer Type, Phone/Fax/Email/Website, dates, Job Description and the benefits section aren't stored in the app and are left blank."),
+      el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' }, [permOpenLink, permBtn]),
+      permStatusMsg,
+    ]);
+    if (blocker) {
+      permStatusMsg.style.color = 'var(--danger)';
+      permStatusMsg.textContent = blocker;
+    }
   }
 
   const errBox = el('div', { class: 'login-err' }, '');
@@ -1634,6 +1993,8 @@ async function openForm(ent, existingRow) {
     },
   }, [
     ...(ksaPullBlock ? [ksaPullBlock] : []),
+    ...(beoePushBlock ? [beoePushBlock] : []),
+    ...(beoePermBlock ? [beoePermBlock] : []),
     fieldsArea,
     errBox,
     el('div', { class: 'modal-actions' }, [
@@ -1654,6 +2015,12 @@ async function openForm(ent, existingRow) {
   if (ent.key === 'datatable') {
     boxAttrs.style = 'width:min(96vw, 1600px);max-width:1600px;max-height:92vh;overflow-y:auto;';
   }
+  // EMPLOYER's form-grid has ~20 fields — wide enough to lay several
+  // columns out side by side on a normal screen instead of stacking into
+  // one narrow column.
+  if (ent.key === 'employer') {
+    boxAttrs.style = 'width:min(94vw, 1100px);max-width:1100px;max-height:92vh;overflow-y:auto;';
+  }
   const box = el('div', boxAttrs, [
     el('button', { class: 'modal-close', onclick: () => overlay.remove() }, '✕'),
     el('h3', {}, existingRow ? `Edit ${ent.label.replace(/s$/, '')}` : `Add ${ent.label.replace(/s$/, '')}`),
@@ -1664,6 +2031,7 @@ async function openForm(ent, existingRow) {
 }
 
 async function deleteRow(ent, row) {
+  if (!isAdmin()) { toast('Your account is read-only — deleting records requires an Admin account.'); return; }
   if (!confirm(`Delete this ${ent.label.toLowerCase().replace(/s$/, '')} record? This cannot be undone.`)) return;
   const { error } = await sb.from(ent.table).delete().eq(ent.pk, row[ent.pk]);
   if (error) { toast('Delete failed: ' + error.message); return; }
