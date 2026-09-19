@@ -591,14 +591,15 @@ function renderShell() {
     el('div', { class: 'sidebar-item', 'data-key': 'searchform', onclick: () => selectEntity('searchform') }, [
       el('i', { class: 'fa-solid fa-magnifying-glass-chart' }), 'Search Candidates',
     ]),
-    // Reports, User Accounts, and Companies are visible only to Developer —
-    // Admin can add/edit/delete data but doesn't get these three. Same
-    // reasoning for Receivables, Transactions, and Accounts below. Visa
-    // Expenses is hidden from every role, Developer included — see
-    // isDeveloper() above.
-    ...(isDeveloper() ? [el('div', { class: 'sidebar-item', 'data-key': 'reports', onclick: () => selectEntity('reports') }, [
+    // Reports is now visible to every role — Admin and User can view/print
+    // existing reports, but can't design/edit/delete them (see
+    // renderReportsList and renderReportDesigner's own isDeveloper()
+    // guards below). User Accounts and Companies stay Developer-only, as
+    // do Receivables, Transactions, and Accounts. Visa Expenses is hidden
+    // from every role, Developer included — see isDeveloper() above.
+    el('div', { class: 'sidebar-item', 'data-key': 'reports', onclick: () => selectEntity('reports') }, [
       el('i', { class: 'fa-solid fa-file-lines' }), 'Reports',
-    ])] : []),
+    ]),
     ...groups.flatMap(g => [
       el('div', { class: 'sidebar-group-label' }, g),
       ...window.ENTITIES.filter(e =>
@@ -615,9 +616,22 @@ function renderShell() {
     ]),
   ]);
 
+  const quickSearchInput = el('input', {
+    type: 'text',
+    placeholder: 'Search by Name / Passport No / Enumber…',
+    style: 'width:260px;padding:7px 10px;border:1px solid var(--border);border-radius:6px;font-size:.85rem;',
+  });
+  const quickSearchGo = () => runQuickCandidateSearch(quickSearchInput.value);
+  quickSearchInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') quickSearchGo(); });
+  const quickSearchBox = el('div', { style: 'position:relative;display:flex;align-items:center;gap:6px;' }, [
+    quickSearchInput,
+    el('button', { class: 'btn btn-outline btn-sm', onclick: quickSearchGo, title: 'Search candidates' }, [el('i', { class: 'fa-solid fa-magnifying-glass' })]),
+  ]);
+
   const topbar = el('div', { class: 'topbar' }, [
     el('h2', { id: 'pageTitle' }, 'Dashboard'),
     el('div', { class: 'who' }, [
+      quickSearchBox,
       currentAgencyName ? el('span', { class: 'agency-badge' }, [el('i', { class: 'fa-solid fa-building' }), ' ' + currentAgencyName]) : '',
       currentUser ? el('span', {}, ' ' + (currentUser.strUserName || '')) : '',
     ]),
@@ -632,6 +646,61 @@ function setActiveSidebar(key) {
   document.querySelectorAll('.sidebar-item').forEach(n => n.classList.toggle('active', n.getAttribute('data-key') === key));
 }
 
+// Topbar quick search — separate from the full "Search Candidates" page,
+// this is meant for a fast lookup from anywhere in the app: type a Name,
+// Passport No, or Enumber and hit Enter, and a results list pops up over
+// whatever page you're currently on. Always fetches fresh from Supabase
+// (rather than trusting whatever's already in `cache`) since it needs to
+// work correctly no matter which page you searched from — the DATATABLE
+// cache is only guaranteed populated while you're actually on a DATATABLE
+// page.
+const QUICK_SEARCH_RESULT_FIELDS = [
+  'NAME', 'FATHERSNAME', 'PASSPORTNO', 'Enumber', 'CATEGORY', 'REQTRADE',
+  'STATUS', 'VISASTAMPED', 'TRAVELDATE', 'COID', 'REMARKS',
+];
+async function runQuickCandidateSearch(term) {
+  const q = term.trim();
+  if (!q) { toast('Type a name, passport number, or Enumber to search.'); return; }
+  const dtEnt = entityByKey('datatable');
+  const { data, error } = await fetchAllRows(dtEnt.table, dtEnt.pk, dtEnt.agencyField);
+  if (error) { toast('Search failed: ' + error.message); return; }
+  cache[dtEnt.table] = data || [];
+  refCache[dtEnt.table] = {};
+  (data || []).forEach(row => { refCache[dtEnt.table][row[dtEnt.pk]] = row[dtEnt.displayField] ?? `#${row[dtEnt.pk]}`; });
+
+  const qLower = q.toLowerCase();
+  const matches = (data || []).filter(r =>
+    String(r.NAME ?? '').toLowerCase().includes(qLower) ||
+    String(r.PASSPORTNO ?? '').toLowerCase().includes(qLower) ||
+    String(r.Enumber ?? '').toLowerCase().includes(qLower)
+  );
+  showQuickSearchResults(dtEnt, q, matches);
+}
+
+function showQuickSearchResults(dtEnt, term, matches) {
+  const overlay = el('div', { class: 'modal-overlay', onclick: (e) => { if (e.target === overlay) overlay.remove(); } });
+  const fields = QUICK_SEARCH_RESULT_FIELDS.map(name => dtEnt.fields.find(f => f.name === name)).filter(Boolean);
+
+  const body = matches.length
+    ? el('div', { style: 'overflow:auto;max-height:65vh;' }, el('table', { class: 'data-table' }, [
+        el('thead', {}, el('tr', {}, fields.map(f => el('th', {}, f.label)))),
+        el('tbody', {}, matches.map(row => el('tr', {
+          style: 'cursor:pointer;',
+          title: 'Click to open this candidate',
+          onclick: () => { overlay.remove(); openForm(dtEnt, row); },
+        }, fields.map(f => el('td', {}, formatCell(f, row[f.name], dtEnt, row)))))),
+      ]))
+    : el('div', { class: 'empty-state' }, `No candidates matched "${term}".`);
+
+  const box = el('div', { class: 'modal-box', style: 'max-width:1100px;width:95vw;' }, [
+    el('button', { class: 'modal-close', onclick: () => overlay.remove() }, '✕'),
+    el('h3', {}, `Search results for "${term}" (${matches.length})`),
+    body,
+  ]);
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+}
+
 async function selectEntity(key) {
   currentEntityKey = key;
   searchTerm = '';
@@ -644,7 +713,6 @@ async function selectEntity(key) {
   if (key === 'dashboard') { await showDashboard(); return; }
   if (key === 'searchform') { await renderSearchForm(); return; }
   if (key === 'reports') {
-    if (!isDeveloper()) { toast('Reports is only available to Developer accounts.'); await showDashboard(); return; }
     await renderReportsList(); return;
   }
   if (key === 'tbl_user' && !isDeveloper()) {
@@ -1492,14 +1560,16 @@ async function openForm(ent, existingRow) {
   // make sure dropdown ref data is fresh
   await preloadRefCaches();
 
+  const NO_CLICK_OUTSIDE_CLOSE = ['datatable', 'employer', 'category'];
   const overlay = el('div', {
     class: 'modal-overlay',
     onclick: (e) => {
-      // DATATABLE's form is long, with a lot to type in — an accidental
-      // click on the dimmed background shouldn't lose it. It only closes via
-      // the ✕ / Cancel buttons or after a successful Save. Other, shorter
-      // forms keep the old click-outside-to-close behavior.
-      if (e.target === overlay && ent.key !== 'datatable') overlay.remove();
+      // These forms take real effort to fill in — an accidental click on
+      // the dimmed background (or a stray click while the cursor passes
+      // over it) shouldn't lose everything typed so far. They only close
+      // via the ✕ / Cancel buttons or after a successful Save. Other,
+      // shorter forms keep the old click-outside-to-close behavior.
+      if (e.target === overlay && !NO_CLICK_OUTSIDE_CLOSE.includes(ent.key)) overlay.remove();
     },
   });
   const inputs = {};
@@ -1507,6 +1577,7 @@ async function openForm(ent, existingRow) {
 
   const fieldNodes = ent.fields.map(f => {
     let inputEl;
+    let extraNode = null;
     const val = existingRow ? existingRow[f.name] : resolveDefaultValue(f);
     const isAgencyField = ent.agencyField && f.name === ent.agencyField;
     if (f.type === 'textarea') {
@@ -1523,6 +1594,24 @@ async function openForm(ent, existingRow) {
       // not looked up from another table, e.g. Active: True/False.
       const options = [el('option', { value: '' }, '— none —'), ...f.options.map(o => el('option', { value: o }, o))];
       inputEl = el('select', {}, options);
+      inputEl.value = val ?? '';
+    } else if (f.type === 'textlist') {
+      // A plain text input backed by a native browser dropdown of every
+      // distinct, non-blank value already used for THIS column in THIS
+      // table — e.g. Category's own Category/Categoryarbic/Reqtrade, so
+      // "LABOUR" doesn't slowly end up entered five slightly different
+      // ways. Still a free-text field underneath (a <datalist> only
+      // suggests, it never restricts), so a genuinely new value can
+      // always be typed — this discourages accidental duplicates without
+      // hard-locking out new ones.
+      const listId = `dl_${ent.key}_${f.name}`;
+      const distinct = [...new Set(
+        (cache[ent.table] || [])
+          .map(r => (r[f.name] == null ? '' : String(r[f.name]).trim()))
+          .filter(v => v !== '')
+      )].sort((a, b) => a.localeCompare(b));
+      extraNode = el('datalist', { id: listId }, distinct.map(v => el('option', { value: v }, '')));
+      inputEl = el('input', { type: 'text', list: listId });
       inputEl.value = val ?? '';
     } else if (f.type === 'select') {
       const refEnt = entityByKey(f.ref);
@@ -1575,6 +1664,7 @@ async function openForm(ent, existingRow) {
     const node = el('div', { class: wrapClass }, [
       el('label', {}, f.label + (f.required ? ' *' : '') + (isAgencyField ? ' (locked to current agency)' : '')),
       inputEl,
+      ...(extraNode ? [extraNode] : []),
     ]);
     fieldNodesByName[f.name] = node;
     return node;
@@ -1592,6 +1682,34 @@ async function openForm(ent, existingRow) {
     if (ent.key === 'employer') {
       wireAutoTranslate(inputs.ARBICCOMPANY, inputs.NAMEOFEMPLOYER, 'ar', 'en');
     }
+  }
+
+  // Category auto-fill: picking (or typing) a Category name that already
+  // exists elsewhere fills in that same category's own
+  // Categoryarbic/Reqtrade, from whichever existing row used that name
+  // most recently — saves re-typing the Arabic translation and trade
+  // every time the same category comes up again. Wired as a live listener
+  // on Category only, same reasoning as the Datatable Status auto-set
+  // elsewhere: it only fires while Category is actually being typed into,
+  // so opening an existing category to edit something unrelated never
+  // silently rewrites its Categoryarbic/Reqtrade.
+  if (ent.key === 'category' && inputs.CATEGORY) {
+    const applyCategoryFieldAutofill = () => {
+      const typed = String(inputs.CATEGORY.value ?? '').trim().toLowerCase();
+      if (!typed) return;
+      const match = (cache[ent.table] || [])
+        .filter(r => String(r.CATEGORY ?? '').trim().toLowerCase() === typed)
+        .sort((a, b) => (b.CATEGORYID ?? 0) - (a.CATEGORYID ?? 0))[0];
+      if (!match) return;
+      if (inputs.CATEGORYARBIC && String(match.CATEGORYARBIC ?? '').trim() !== '') {
+        inputs.CATEGORYARBIC.value = match.CATEGORYARBIC;
+      }
+      if (inputs.REQTRADE && String(match.REQTRADE ?? '').trim() !== '') {
+        inputs.REQTRADE.value = match.REQTRADE;
+      }
+    };
+    inputs.CATEGORY.addEventListener('input', applyCategoryFieldAutofill);
+    inputs.CATEGORY.addEventListener('change', applyCategoryFieldAutofill);
   }
 
   // Section headings + a wider grid (repeat(auto-fill, minmax(...))) so more
@@ -2521,15 +2639,24 @@ async function renderReportsList() {
     el('div', {}, 'Report designs are saved in THIS BROWSER, on THIS WEBSITE ADDRESS only — use Export/Import to move them to another site (e.g. from local testing to your live Netlify URL) or another computer/browser.'),
     el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' }, [
       el('button', { class: 'btn btn-outline', onclick: () => exportAllReports(reports) }, [el('i', { class: 'fa-solid fa-download' }), ' Export All']),
+      // Import is now open to every role, same as Export/Print — it's the
+      // one report-management action Admin/User also get. New Report
+      // (design from scratch), Edit, and Delete stay Developer-only below.
       el('button', { class: 'btn btn-outline', onclick: () => importInput.click() }, [el('i', { class: 'fa-solid fa-upload' }), ' Import']),
       importInput,
-      el('button', { class: 'btn btn-primary', onclick: () => renderReportDesigner(null) }, [el('i', { class: 'fa-solid fa-plus' }), ' New Report']),
+      ...(isDeveloper() ? [
+        el('button', { class: 'btn btn-primary', onclick: () => renderReportDesigner(null) }, [el('i', { class: 'fa-solid fa-plus' }), ' New Report']),
+      ] : []),
     ]),
   ]);
   content.appendChild(toolbar);
 
   if (!reports.length) {
-    content.appendChild(el('div', { class: 'empty-state' }, 'No saved reports yet — click "New Report" to design one, or "Import" if you have an export from another site.'));
+    content.appendChild(el('div', { class: 'empty-state' },
+      isDeveloper()
+        ? 'No saved reports yet — click "New Report" to design one, or "Import" if you have an export from another site.'
+        : 'No saved reports yet — click "Import" if you have an export from another site, or ask a Developer to design one.'
+    ));
     return;
   }
 
@@ -2537,18 +2664,25 @@ async function renderReportsList() {
     el('td', {}, r.name),
     el('td', {}, String((r.elements || []).filter(x => x.type === 'field').length) + ' fields'),
     el('td', {}, [
-      el('button', { class: 'btn btn-outline btn-sm', onclick: () => renderReportDesigner(r) }, 'Edit'),
-      ' ',
+      // Edit and Delete change/remove a shared report design, so they stay
+      // Developer-only, same as New Report and Import above — Admin/User
+      // can still open and print any existing report.
+      ...(isDeveloper() ? [
+        el('button', { class: 'btn btn-outline btn-sm', onclick: () => renderReportDesigner(r) }, 'Edit'),
+        ' ',
+      ] : []),
       el('button', { class: 'btn btn-primary btn-sm', onclick: () => openReportPrintPicker(r) }, [el('i', { class: 'fa-solid fa-print' }), ' Print']),
-      ' ',
-      el('button', {
-        class: 'btn btn-danger btn-sm',
-        onclick: () => {
-          if (!confirm(`Delete report "${r.name}"? This can't be undone.`)) return;
-          saveSavedReportsList(loadSavedReports().filter(x => x.id !== r.id));
-          renderReportsList();
-        },
-      }, 'Delete'),
+      ...(isDeveloper() ? [
+        ' ',
+        el('button', {
+          class: 'btn btn-danger btn-sm',
+          onclick: () => {
+            if (!confirm(`Delete report "${r.name}"? This can't be undone.`)) return;
+            saveSavedReportsList(loadSavedReports().filter(x => x.id !== r.id));
+            renderReportsList();
+          },
+        }, 'Delete'),
+      ] : []),
     ]),
   ]));
   content.appendChild(el('table', { class: 'data-table' }, [
