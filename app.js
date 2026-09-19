@@ -40,6 +40,9 @@ let listFilterValue = ''; // selected value for entities with a listFilter dropd
 let listDateFrom = '';    // "dd/mm/yyyy" text — Agent/Employer Ledger date-range filter
 let listDateTo = '';
 let currentPage = 1;
+let agentCheckFilter = ''; // '', 'true', or 'false' — the Active/Non Active buttons on the Agent list
+let employerActiveFilter = ''; // same idea, Employer.ACTIVE
+let categorySelectFilter = ''; // same idea, Category.SELECT
 let printSelectedIds = new Set(); // checked rows for entities with ent.printReports (e.g. Employer)
 const PAGE_SIZE = 100;
 let cache = {};       // table -> rows (raw)
@@ -708,6 +711,9 @@ async function selectEntity(key) {
   listDateFrom = '';
   listDateTo = '';
   currentPage = 1;
+  agentCheckFilter = '';
+  employerActiveFilter = '';
+  categorySelectFilter = '';
   printSelectedIds = new Set();
   setActiveSidebar(key);
   if (key === 'dashboard') { await showDashboard(); return; }
@@ -846,6 +852,9 @@ async function renderSearchForm() {
   const dateToInp = el('input', { type: 'text', placeholder: 'dd/mm/yyyy' });
   const fsaDateFromInp = el('input', { type: 'text', placeholder: 'dd/mm/yyyy' });
   const fsaDateToInp = el('input', { type: 'text', placeholder: 'dd/mm/yyyy' });
+  // Free-text search by Name, Passport No, or Enumber — combines (AND) with
+  // every other filter below, same as they already combine with each other.
+  const nameSearchInput = el('input', { type: 'text', placeholder: 'Search by Name, Passport No, or Enumber…' });
 
   // Checkbox selection, tracked by DID, so it survives filter/page changes —
   // select some candidates, adjust a filter, they're still selected.
@@ -887,6 +896,7 @@ async function renderSearchForm() {
   }, 'Show All');
 
   const filterBar = el('div', { class: 'toolbar', style: 'flex-wrap:wrap;gap:16px;align-items:flex-end;' }, [
+    el('div', { class: 'f-field' }, [el('label', {}, 'Search (Name / Passport No / Enumber)'), nameSearchInput]),
     el('div', { class: 'f-field' }, [el('label', {}, 'Agent'), agentSelect]),
     el('div', { class: 'f-field' }, [el('label', {}, 'Employer'), employerSelect]),
     el('div', { class: 'f-field' }, [el('label', {}, 'Status'), statusSelect]),
@@ -907,6 +917,16 @@ async function renderSearchForm() {
   let searchPage = 1;
   function matchesFilters(row) {
     if (showOnlySelected && !selectedIds.has(row[dtEnt.pk])) return false;
+    const query = nameSearchInput.value.trim();
+    if (query) {
+      // Word-by-word, same convention as the rest of the app: every typed
+      // word must be found somewhere across Name, Passport No, or Enumber —
+      // not required to be contiguous or all in the same field.
+      const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+      const haystacks = [row.NAME, row.PASSPORTNO, row.Enumber].map(v => String(v ?? '').toLowerCase());
+      const allWordsMatch = words.every(w => haystacks.some(h => h.includes(w)));
+      if (!allWordsMatch) return false;
+    }
     if (agentSelect.value && String(row.COID ?? '') !== String(agentSelect.value)) return false;
     if (employerSelect.value && String(row.EMPID ?? '') !== String(employerSelect.value)) return false;
     if (statusSelect.value && String(row.STATUS ?? '') !== String(statusSelect.value)) return false;
@@ -1009,6 +1029,7 @@ async function renderSearchForm() {
   }
 
   const runSearch = () => { searchPage = 1; renderSearchResults(); };
+  nameSearchInput.addEventListener('input', runSearch);
   [agentSelect, employerSelect, statusSelect].forEach(inp => inp.addEventListener('change', runSearch));
   [dateFromInp, dateToInp, fsaDateFromInp, fsaDateToInp].forEach(inp => inp.addEventListener('input', runSearch));
 
@@ -1066,7 +1087,23 @@ function renderEntityList(ent) {
   // Search/filter controls sit on their own row, buttons on the row below —
   // stacked instead of side-by-side, so a wide filter row (picklist + two
   // date boxes) never overlaps or hides the action buttons.
+  // Shared by the Agent/Employer/Category lists below — three checkbox-ish
+  // fields (Agent.CHECK, Employer.ACTIVE, Category.SELECT), same All/Active/
+  // Non Active pattern for each. Rebuilds the whole toolbar (not just
+  // refreshEntityListBody) on click so the pressed button's own highlight
+  // (btn-primary vs btn-outline) updates immediately too, not just the
+  // filtered rows below it.
+  const activeFilterButtons = (getVal, setVal) => {
+    const filterBtn = (value, label) => el('button', {
+      class: getVal() === value ? 'btn btn-primary' : 'btn btn-outline',
+      onclick: () => { setVal(value); currentPage = 1; renderEntityList(ent); },
+    }, label);
+    return [filterBtn('', 'All'), filterBtn('true', 'Active'), filterBtn('false', 'Non Active')];
+  };
   const buttonRow = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' }, [
+    ...(ent.key === 'agent' ? activeFilterButtons(() => agentCheckFilter, (v) => { agentCheckFilter = v; }) : []),
+    ...(ent.key === 'employer' ? activeFilterButtons(() => employerActiveFilter, (v) => { employerActiveFilter = v; }) : []),
+    ...(ent.key === 'category' ? activeFilterButtons(() => categorySelectFilter, (v) => { categorySelectFilter = v; }) : []),
     ...(ent.key === 'agentledger' || ent.key === 'employerledger'
       ? [
           el('button', { class: 'btn btn-outline', onclick: () => printLedgerReport(ent) }, [el('i', { class: 'fa-solid fa-print' }), ' Print Report']),
@@ -1075,39 +1112,29 @@ function renderEntityList(ent) {
           ...(isAdmin() ? [el('button', { class: 'btn btn-outline', onclick: () => renderDuplicatesPanel(ent) }, [el('i', { class: 'fa-solid fa-clone' }), ' Find Duplicate Entries'])] : []),
         ]
       : []),
-    ...(ent.key === 'datatable'
-      ? [
-          el('button', { class: 'btn btn-outline', onclick: () => openVisaFormKhi() }, [el('i', { class: 'fa-solid fa-print' }), ' Visa Form KHI']),
-          el('button', { class: 'btn btn-outline', onclick: () => openVisaFormIsb() }, [el('i', { class: 'fa-solid fa-print' }), ' Visa Form ISB']),
-        ]
-      : []),
+    // The old "Visa Form KHI"/"Visa Form ISB" shortcut buttons that used to
+    // sit here were removed — DATATABLE's own printReports row below the
+    // search box (Visa Form Karachi / Visa Form ISB / ISB Undertaking /
+    // ISB Barcodes, whichever of those actually exist as saved reports)
+    // already covers the same two reports plus more, so having both was
+    // redundant.
     el('button', { class: 'btn btn-outline', onclick: () => exportCsv(ent) }, [el('i', { class: 'fa-solid fa-download' }), ' Export Report (CSV)']),
     // Read-only accounts can search and print but not add records.
     ...(isAdmin() ? [el('button', { class: 'btn btn-primary', onclick: () => openForm(ent, null) }, [el('i', { class: 'fa-solid fa-plus' }), ` Add ${ent.label.replace(/s$/, '')}`])] : []),
   ]);
-  // Search row sits flush against the button row below it — no vertical
-  // gap between them (was gap:12px).
-  const hasPrintReports = !!(ent.printReports && ent.printReports.length);
-  const toolbar = el('div', {
-    class: 'toolbar',
-    // When this entity also gets the Category-style print-buttons row right
-    // underneath (see below), drop the toolbar's own bottom margin too —
-    // otherwise the shared .toolbar class's margin-bottom:16px leaves a gap
-    // above that row even though the row itself is already flush (margin:0
-    // in buildReportButtonsRow).
-    style: `display:flex;flex-direction:column;align-items:stretch;gap:0;${hasPrintReports ? 'margin-bottom:0;' : ''}`,
-  }, [
-    searchControl,
-    buttonRow,
-  ]);
-  content.appendChild(toolbar);
-
-  // Entities with ent.printReports (currently just Categories) get a row of
-  // print buttons above the list — check the rows you want with the extra
-  // checkbox column (added in refreshEntityListBody below), then click a
-  // report to print it for whichever rows are checked.
-  if (ent.printReports && ent.printReports.length) {
-    const matching = loadSavedReports().filter(r => ent.printReports.map(n => n.toLowerCase()).includes(r.name.trim().toLowerCase()));
+  // Entities with ent.printReports (an explicit include-list, e.g.
+  // Categories and DATATABLE) or ent.printReportsExclude (everything EXCEPT
+  // a named list) get a row of print buttons — check the rows you want with
+  // the extra checkbox column (added in refreshEntityListBody below), then
+  // click a report to print it for whichever rows are checked. Built here
+  // (before the toolbar) so it can sit inside the toolbar itself, right
+  // after the search box and before the rest of the buttons.
+  const hasPrintReports = !!((ent.printReports && ent.printReports.length) || ent.printReportsExclude);
+  let printReportsRow = null;
+  if (hasPrintReports) {
+    const matching = ent.printReports
+      ? loadSavedReports().filter(r => ent.printReports.map(n => n.toLowerCase()).includes(r.name.trim().toLowerCase()))
+      : loadSavedReports().filter(r => !ent.printReportsExclude.map(n => n.toLowerCase()).includes(r.name.trim().toLowerCase()));
     const getSelected = () => {
       const rows = (cache[ent.table] || []).filter(row => printSelectedIds.has(row[ent.pk]));
       if (ent.key !== 'category') return rows;
@@ -1152,8 +1179,18 @@ function renderEntityList(ent) {
       // checked at once, their pages still come out grouped together.
       return grouped.sort((a, b) => String(a.EMPID ?? '').localeCompare(String(b.EMPID ?? ''), undefined, { numeric: true }));
     };
-    if (matching.length) content.appendChild(buildReportButtonsRow(matching, getSelected));
+    if (matching.length) printReportsRow = buildReportButtonsRow(matching, getSelected);
   }
+  // Search row sits flush against whatever comes below it — no vertical gap.
+  const toolbar = el('div', {
+    class: 'toolbar',
+    style: 'display:flex;flex-direction:column;align-items:stretch;gap:0;',
+  }, [
+    searchControl,
+    ...(printReportsRow ? [printReportsRow] : []),
+    buttonRow,
+  ]);
+  content.appendChild(toolbar);
 
   const listBody = el('div', { id: 'entityListBody' }, []);
   content.appendChild(listBody);
@@ -1189,10 +1226,12 @@ function refreshEntityListBody(ent) {
     // in entities.js. A name in the list that no longer exists as a field is
     // skipped rather than rendering a blank column.
     ? DATATABLE_LIST_FIELDS.map(name => ent.fields.find(f => f.name === name)).filter(Boolean)
+    : ent.key === 'agent'
+    ? AGENT_LIST_FIELDS.map(name => ent.fields.find(f => f.name === name)).filter(Boolean)
     : ent.key === 'employer'
     ? ent.fields.filter(f => !EMPLOYER_HIDDEN_LIST_FIELDS.includes(f.name))
     : ent.fields; // show every column, matching the Supabase table exactly
-  const hasPrintReports = !!(ent.printReports && ent.printReports.length);
+  const hasPrintReports = !!((ent.printReports && ent.printReports.length) || ent.printReportsExclude);
   let selectAllBox = null;
   if (hasPrintReports) {
     selectAllBox = el('input', { type: 'checkbox' });
@@ -1370,6 +1409,21 @@ function filteredRows(ent) {
       });
     }
   }
+  // Active / Non Active buttons on the Agent list, filtering on CHECK.
+  if (ent.key === 'agent' && agentCheckFilter) {
+    rows = rows.filter(row => row.CHECK === (agentCheckFilter === 'true'));
+  }
+  // Same idea for Employer.ACTIVE and Category.SELECT — both are
+  // staticselect "True"/"False" fields rather than a real boolean checkbox
+  // like Agent.CHECK, so compared as text (tolerant of either an actual
+  // boolean or the literal string coming back from Supabase) rather than
+  // with a strict === true/false check.
+  if (ent.key === 'employer' && employerActiveFilter) {
+    rows = rows.filter(row => (String(row.ACTIVE ?? '').trim().toLowerCase() === 'true') === (employerActiveFilter === 'true'));
+  }
+  if (ent.key === 'category' && categorySelectFilter) {
+    rows = rows.filter(row => (String(row.SELECT ?? '').trim().toLowerCase() === 'true') === (categorySelectFilter === 'true'));
+  }
   const query = searchTerm.trim();
   if (!query) return rows;
 
@@ -1429,6 +1483,15 @@ const CUSTOM_OPTION_LABELS = {
       if (emp.VISANO) parts.push(`Visa: ${emp.VISANO}`);
       if (emp.DEMAND !== null && emp.DEMAND !== undefined && emp.DEMAND !== '') parts.push(`Demand: ${emp.DEMAND}`);
     }
+    return parts.join(' — ');
+  },
+  // DATATABLE -> Agent: show the agent's name, agency, and passport no
+  // together, so agents with similar names (or the same agency) can still
+  // be told apart in the dropdown.
+  'datatable.COID': (row) => {
+    const parts = [row.AGENTNAME || '(no name)'];
+    if (row.AGENCY) parts.push(row.AGENCY);
+    if (row.passportno) parts.push(`Passport: ${row.passportno}`);
     return parts.join(' — ');
   },
 };
@@ -1496,6 +1559,11 @@ const DATATABLE_LIST_FIELDS = [
   'REMARKS',
 ];
 
+// LIST ONLY, same as DATATABLE_LIST_FIELDS above — Check moved to the front
+// so it's the first, most-scannable column; the Add/Edit Agent form is
+// untouched and keeps its own original field order.
+const AGENT_LIST_FIELDS = ['CHECK', 'AGENTNAME', 'AGENCY', 'RESIDENT', 'TEL', 'MOB', 'EMAIL', 'trade', 'passportno', 'status', 'AGENCYID'];
+
 // The Employer list, unlike DATATABLE above, hides just a few columns
 // instead of naming everything it keeps — a denylist rather than an
 // allowlist. Also LIST ONLY: the Add/Edit Employer form still shows every
@@ -1560,7 +1628,7 @@ async function openForm(ent, existingRow) {
   // make sure dropdown ref data is fresh
   await preloadRefCaches();
 
-  const NO_CLICK_OUTSIDE_CLOSE = ['datatable', 'employer', 'category'];
+  const NO_CLICK_OUTSIDE_CLOSE = ['datatable', 'employer', 'category', 'agent'];
   const overlay = el('div', {
     class: 'modal-overlay',
     onclick: (e) => {
@@ -1637,6 +1705,10 @@ async function openForm(ent, existingRow) {
         // blank the field out from under you.
         if (refEnt.key === 'employer' && r.ACTIVE === false && String(r[refEnt.pk]) !== currentVal) return;
         if (refEnt.key === 'category' && !isCategoryEmployerActive(r) && String(r[refEnt.pk]) !== currentVal) return;
+        // Same idea for Agent (COID) — only Check = true agents are offered,
+        // unless this record already points at one that's since been
+        // unchecked, in which case keep showing it rather than blanking it.
+        if (refEnt.key === 'agent' && r.CHECK !== true && String(r[refEnt.pk]) !== currentVal) return;
         const label = labelFn ? labelFn(r) : (r[refEnt.displayField] ?? ('#' + r[refEnt.pk]));
         options.push(el('option', { value: r[refEnt.pk] }, String(label)));
       });
@@ -1645,6 +1717,26 @@ async function openForm(ent, existingRow) {
       // can't be reassigned to a different agency while viewing this one.
       inputEl.value = isAgencyField ? String(currentAgencyId ?? '') : (val ?? '');
       if (isAgencyField) inputEl.disabled = true;
+    } else if (f.type === 'dmydate') {
+      // Still a plain text column underneath (formatDateDMY/parseStoredDate
+      // elsewhere already read dd/mm/yyyy text fine) — this just actively
+      // helps TYPE it that way instead of only hoping for it: auto-inserts
+      // the two "/" separators as digits go in, and flags (border colour
+      // only, never blocks saving — an unusual real date shouldn't get
+      // stuck) anything left that isn't a full dd/mm/yyyy on blur.
+      inputEl = el('input', { type: 'text', placeholder: 'dd/mm/yyyy', maxLength: '10' });
+      inputEl.value = val ?? '';
+      inputEl.addEventListener('input', () => {
+        const digits = inputEl.value.replace(/\D/g, '').slice(0, 8);
+        let out = digits.slice(0, 2);
+        if (digits.length > 2) out += '/' + digits.slice(2, 4);
+        if (digits.length > 4) out += '/' + digits.slice(4, 8);
+        inputEl.value = out;
+      });
+      inputEl.addEventListener('blur', () => {
+        const ok = inputEl.value === '' || /^\d{2}\/\d{2}\/\d{4}$/.test(inputEl.value);
+        inputEl.style.borderColor = ok ? '' : 'var(--danger)';
+      });
     } else {
       // strUserPassword masks like a real password field — everything else
       // in this generic renderer is untouched.
@@ -1791,6 +1883,23 @@ async function openForm(ent, existingRow) {
       // (so the derived fields reflect the currently-linked category /
       // employer rather than whatever was saved historically).
       applyCategoryAutofill(inputs.CATEGORYID.value);
+    }
+
+    // Agent (Coid) -> Mobile / Passport No: a convenience default only,
+    // NOT a locked/derived field like the autofills above — Mobile and
+    // Passport No are the candidate's own editable details, so this only
+    // fills them in while they're still blank (a fresh Add, agent picked
+    // first) and never overwrites something already typed in, including on
+    // a later change of agent.
+    if (inputs.COID) {
+      inputs.COID.addEventListener('change', () => {
+        const agentEnt = entityByKey('agent');
+        const agentRow = (cache[agentEnt.table] || [])
+          .find(a => String(a[agentEnt.pk]) === String(inputs.COID.value));
+        if (!agentRow) return;
+        if (inputs.Mobile && !inputs.Mobile.value.trim() && agentRow.MOB) inputs.Mobile.value = agentRow.MOB;
+        if (inputs.PASSPORTNO && !inputs.PASSPORTNO.value.trim() && agentRow.passportno) inputs.PASSPORTNO.value = agentRow.passportno;
+      });
     }
 
     // Status auto-set: Visastamped/FSANo/FSADate/Traveldate each imply a
@@ -2729,13 +2838,12 @@ async function renderPdfFirstPageToDataUrl(arrayBuffer) {
 }
 
 function renderReportDesigner(existingReport) {
-  // Same choke-point pattern as openForm's isAdmin() guard: the "Reports"
-  // sidebar tab is hidden from non-Admin accounts, but the "Visa Form
-  // KHI"/"Visa Form ISB" shortcut buttons can still reach this function
-  // directly (their fallback for when that named report doesn't exist yet)
-  // — so it needs its own guard rather than relying only on the tab being
-  // hidden. Printing an EXISTING report (openReportPrintPicker) is
-  // deliberately NOT gated here — read-only accounts can still print.
+  // Same choke-point pattern as openForm's isAdmin() guard: this is the only
+  // place a new/edited report actually gets saved, so it's guarded here
+  // directly rather than relying only on the "Reports" tab being hidden for
+  // non-Developer accounts. Printing an EXISTING report
+  // (openReportPrintPicker) is deliberately NOT gated here — read-only
+  // accounts can still print.
   if (!isDeveloper()) { toast('Designing reports requires a Developer account.'); return; }
   document.getElementById('pageTitle').textContent = (existingReport && existingReport.id) ? `Edit Report: ${existingReport.name}` : 'New Report';
   const content = document.getElementById('content');
@@ -3278,31 +3386,6 @@ async function openReportPrintPicker(report) {
   document.body.appendChild(overlay);
 }
 
-// The "Visa Form KHI" button on the Candidates page just looks for a saved
-// report named "Visa Form Karachi" / "Visa Form KHI" and opens the normal
-// print picker for it — so design that report once via the Reports tab
-// (any layout you like) and this button always prints the latest version.
-function openVisaFormKhi() {
-  const reports = loadSavedReports();
-  const match = reports.find(r => /visa\s*form\s*(karachi|khi)/i.test(r.name));
-  if (match) { openReportPrintPicker(match); return; }
-  if (!isDeveloper()) { toast('No "Visa Form Karachi" report has been designed yet — ask a Developer to design it.'); return; }
-  if (confirm('No "Visa Form Karachi" report has been designed yet. Design it now?')) {
-    renderReportDesigner({ id: null, name: 'Visa Form Karachi', elements: [] });
-  }
-}
-
-// Same idea for the Islamabad consulate's form.
-function openVisaFormIsb() {
-  const reports = loadSavedReports();
-  const match = reports.find(r => /visa\s*form\s*(islamabad|isb)/i.test(r.name));
-  if (match) { openReportPrintPicker(match); return; }
-  if (!isDeveloper()) { toast('No "Visa Form ISB" report has been designed yet — ask a Developer to design it.'); return; }
-  if (confirm('No "Visa Form ISB" report has been designed yet. Design it now?')) {
-    renderReportDesigner({ id: null, name: 'Visa Form ISB', elements: [] });
-  }
-}
-
 // Reports can place a field from DATATABLE directly (field: "NAME"), or one
 // from the candidate's linked Employer/Category record (field:
 // "EMPLOYER.ARBICCOMPANY" / "CATEGORY.CATEGORYARBIC") — see the grouped
@@ -3429,21 +3512,19 @@ function buildCandidatePage(report, candidate, esc, barcodeCounter) {
 // Shared by the Search Candidates page and the Employer list's print section.
 function buildReportButtonsRow(reports, getSelectedRows) {
   if (!reports.length) return el('div', {});
-  // margin:0 overrides whatever vertical margin the shared .toolbar class
-  // normally adds between stacked sections — without it, this row ends up
-  // with a visible gap above/below even though the buttons inside it are
-  // already tight against each other (gap:8px, side by side, wrapping only
-  // when the row runs out of width).
-  return el('div', { class: 'toolbar', style: 'flex-wrap:wrap;gap:0;margin:0;' },
+  // Deliberately NOT the shared .toolbar class here — that class carries its
+  // own padding (for when it's used as the main toolbar container), which
+  // left visible space above/below this row no matter what margin was set
+  // on it. This is its own minimal wrapper instead, so the space between it
+  // and the search box above is only whatever's set right here.
+  return el('div', { style: 'display:flex;flex-wrap:wrap;gap:6px;padding:0;margin:6px 0 12px;' },
     reports.map(r => el('button', {
       class: 'btn btn-outline',
       // The shared .btn class applies its own margin for buttons used
-      // standalone elsewhere in the app — that's what was still leaving a
-      // gap here even with the container's own gap:0, since gap only
-      // controls spacing it adds itself, not each button's own margin.
-      // Overriding it inline (which always wins over a stylesheet class,
-      // regardless of CSS specificity) is what actually removes it.
-      style: 'margin:0;border-radius:0;',
+      // standalone elsewhere in the app — overriding it inline (which
+      // always wins over a stylesheet class, regardless of CSS specificity)
+      // is what keeps these tight against each other instead of spaced out.
+      style: 'margin:0;',
       onclick: () => printReportForCandidates(r, getSelectedRows()),
     }, [el('i', { class: 'fa-solid fa-print' }), ` ${r.name}`]))
   );
