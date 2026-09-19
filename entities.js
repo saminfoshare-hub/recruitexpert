@@ -53,9 +53,9 @@ window.ENTITIES = [
     fields: [
  { name: "SELECT", label: "Select", type: "staticselect", options: ["True", "False"], defaultValue: "True" },
    { name: "EMPID", label: "Empid", type: "select", ref: "employer" },
-       { name: "CATEGORY", label: "Category", type: "text", required: true },
-      { name: "CATEGORYARBIC", label: "Categoryarbic", type: "text" },
-     { name: "REQTRADE", label: "Reqtrade", type: "text" },
+       { name: "CATEGORY", label: "Category", type: "textlist", required: true },
+      { name: "CATEGORYARBIC", label: "Categoryarbic", type: "textlist" },
+     { name: "REQTRADE", label: "Reqtrade", type: "textlist" },
       { name: "SALARY", label: "Salary", type: "text" },
       { name: "QUANTITY", label: "Quantity", type: "number" },
       { name: "EXPENCE", label: "Expence", type: "number" },    
