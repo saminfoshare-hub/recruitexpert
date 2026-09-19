@@ -17,14 +17,17 @@ window.ENTITIES = [
     key: "agent", table: "AGENT", pk: "COID", label: "Agents", icon: "fa-user-tie",
     group: "Core", displayField: "AGENTNAME", agencyField: "AGENCYID",
     fields: [
+      { name: "AGENTNAME", label: "Agentname / Direct", type: "text", required: true },
+      { name: "passportno", label: "Passportno", type: "text" },
+      { name: "MOB", label: "MOB", type: "text" },
+      { name: "trade", label: "Trade", type: "text" },
+      { name: "status", label: "Status", type: "staticselect", options: ["Selected", "Not Selected", "Got For Medical", "Go For Navtech", "Waiting For Interview", "Medical Fit", "Navtech Passed", "Medical Unfit", "Navtech Failed", "Ready For Visa Process"] },
       { name: "AGENCYID", label: "Agencyid", type: "select", ref: "company" },
-      { name: "AGENTNAME", label: "Agentname", type: "text", required: true },
       { name: "AGENCY", label: "Agency", type: "text" },
       { name: "RESIDENT", label: "Resident", type: "text" },
       { name: "TEL", label: "TEL", type: "text" },
-      { name: "MOB", label: "MOB", type: "text" },
       { name: "EMAIL", label: "Email", type: "text" },
-      { name: "CHECK", label: "Check", type: "text" },
+      { name: "CHECK", label: "Check", type: "checkbox", defaultValue: true },
     ],
   },
   {
@@ -66,7 +69,7 @@ window.ENTITIES = [
     key: "employer", table: "EMPLOYER", pk: "EMPID", label: "Employers", icon: "fa-briefcase",
     group: "Core", displayField: "NAMEOFEMPLOYER", search: ["NAMEOFEMPLOYER", "VISANO"], agencyField: "AGENCYID",
     fields: [
-	{ name: "ACTIVE", label: "Active", type: "staticselect", options: ["True", "False"], defaultValue: "True" },
+	{ name: "ACTIVE", label: "Active", type: "checkbox", defaultValue: true },
 	{ name: "ENTRYDATE", label: "Entrydate", type: "text", defaultValue: "__TODAY__" },
       { name: "FILENO", label: "Fileno", type: "text" },
 	{ name: "ARBICCOMPANY", label: "Arbiccompany", type: "text" },
@@ -99,6 +102,10 @@ window.ENTITIES = [
   {
     key: "datatable", table: "DATATABLE", pk: "DID", label: "DATATABLE", icon: "fa-id-card",
     group: "Core", displayField: "NAME", search: ["NAME", "PASSPORTNO"], agencyField: "AGENCYID",
+    // Just these four on the main Candidates list (Search Candidates still
+    // shows the full set) — matches Search Candidates' own "Karachi group"
+    // naming (row1Reports) exactly.
+    printReports: ["Visa Form Karachi", "Visa Form ISB", "ISB Undertaking", "ISB Barcodes"],
     fields: [
       { name: "COID", label: "Coid", type: "select", ref: "agent" },
       { name: "NAMEOFEMPLOYER", label: "Nameofemployer", type: "text" },
@@ -121,10 +128,10 @@ window.ENTITIES = [
       { name: "ADDRESS", label: "Address", type: "text" },
       { name: "DISTRICT", label: "District", type: "text" },
       { name: "Mobile", label: "Mobile", type: "text" },
-      { name: "DATEOFBIRTH", label: "Dateofbirth", type: "text" },
+      { name: "DATEOFBIRTH", label: "Dateofbirth", type: "dmydate" },
       { name: "PLACEOFBIRTH", label: "Placeofbirth", type: "text" },
-      { name: "DATEOFISSUE", label: "Dateofissue", type: "text" },
-      { name: "DATEOFEXPIRY", label: "Dateofexpiry", type: "text" },
+      { name: "DATEOFISSUE", label: "Dateofissue", type: "dmydate" },
+      { name: "DATEOFEXPIRY", label: "Dateofexpiry", type: "dmydate" },
       { name: "PLACEOFISSUE", label: "Placeofissue", type: "text" },
       { name: "COUNTRY", label: "Country", type: "text", defaultValue: "Pakistan" },
       { name: "CONTRACT", label: "Contract", type: "text", defaultValue: "Two Year" },
@@ -138,7 +145,7 @@ window.ENTITIES = [
       { name: "ADDRESSOFINSURANCE", label: "Addressofinsurance", type: "text" },
       { name: "NICOFINSURANCE", label: "Nicofinsurance", type: "text" },
       { name: "Qualification", label: "Qualification", type: "text" },
-      { name: "DATE", label: "Date", type: "text" },
+      { name: "DATE", label: "Date", type: "dmydate", defaultValue: "__TODAY__" },
       { name: "MEDICALNAME", label: "Medicalname", type: "text" },
       { name: "AUTHORIZATION", label: "Authorization", type: "text" },
       { name: "GMCA", label: "GMCA", type: "text" },
