@@ -876,7 +876,18 @@ async function renderSearchForm() {
   const row2Reports = savedReports.filter(r => ROW2_NAMES.includes(r.name.trim().toLowerCase()));
   const otherReports = savedReports.filter(r => !ROW1_NAMES.includes(r.name.trim().toLowerCase()) && !ROW2_NAMES.includes(r.name.trim().toLowerCase()));
 
-  content.appendChild(buildReportButtonsRow([...row1Reports, ...row2Reports, ...otherReports], getSelectedCandidates));
+  const fsaRefundFormBtn = el('button', {
+    class: 'btn btn-outline',
+    style: 'margin:0;',
+    // Unlike the named-report buttons alongside it, this isn't a Designer
+    // template and doesn't operate on ticked rows — it prints every
+    // candidate matching the filters currently set above (in particular
+    // FSA Date From/To), same as the FSA Refund Form generator on the
+    // Reports page. matchesFilters is defined further down but hoisted
+    // (function declaration), so it's already available by click time.
+    onclick: () => printFsaRefundForm((cache[dtEnt.table] || []).filter(matchesFilters)),
+  }, [el('i', { class: 'fa-solid fa-print' }), ' FSA Refund Form']);
+  content.appendChild(buildReportButtonsRow([...row1Reports, ...row2Reports, ...otherReports], getSelectedCandidates, [fsaRefundFormBtn]));
   if (!savedReports.length) {
     content.appendChild(el('div', { class: 'toolbar' }, el('div', { class: 'empty-state', style: 'padding:8px 0;' }, 'No saved reports yet — build one in Reports first.')));
   }
@@ -1007,10 +1018,15 @@ async function renderSearchForm() {
       });
       return el('tr', {}, [
         el('td', {}, rowCheckbox),
-        ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name], dtEnt, row))),
+        ...visibleFields.map(f => el('td', {}, renderListCell(f, row, dtEnt))),
         el('td', {}, el('div', { class: 'row-actions' }, isAdmin() ? [
           el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(dtEnt, row) }, 'Edit'),
           el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(dtEnt, row) }, 'Delete'),
+          el('button', {
+            class: 'btn btn-sm', style: 'background:#25D366;color:#fff;',
+            title: row.Mobile ? `Send WhatsApp to ${row.Mobile}` : 'No Mobile number saved',
+            onclick: () => sendWhatsAppToCandidate(row),
+          }, [el('i', { class: 'fa-brands fa-whatsapp' }), ' Send']),
         ] : [el('span', { style: 'color:var(--text-mute);font-size:.78rem;' }, '—')])),
       ]);
     }));
@@ -1082,7 +1098,7 @@ function renderEntityList(ent) {
       type: 'text', placeholder: `Search by ${searchLabel}…`, value: searchTerm,
       oninput: (e) => { searchTerm = e.target.value; currentPage = 1; refreshEntityListBody(ent); },
     });
-    searchControl = el('div', { class: 'search-box' }, [el('i', { class: 'fa-solid fa-magnifying-glass' }), searchInput]);
+    searchControl = el('div', { class: 'search-box', style: 'flex:0 1 320px;width:auto;max-width:320px;' }, [el('i', { class: 'fa-solid fa-magnifying-glass' }), searchInput]);
   }
   // Search/filter controls sit on their own row, buttons on the row below —
   // stacked instead of side-by-side, so a wide filter row (picklist + two
@@ -1181,10 +1197,14 @@ function renderEntityList(ent) {
     };
     if (matching.length) printReportsRow = buildReportButtonsRow(matching, getSelected);
   }
-  // Search row sits flush against whatever comes below it — no vertical gap.
+  // Search box and buttons all sit in ONE flowing row (wrapping only when
+  // the window's too narrow for everything), instead of the search box on
+  // its own full-width row with the buttons stacked below it — that was
+  // pushing the actual candidate list down by 2-3 extra rows' worth of
+  // space, showing fewer names on screen before you had to scroll.
   const toolbar = el('div', {
     class: 'toolbar',
-    style: 'display:flex;flex-direction:column;align-items:stretch;gap:0;',
+    style: 'display:flex;flex-direction:row;flex-wrap:wrap;align-items:center;gap:10px;',
   }, [
     searchControl,
     ...(printReportsRow ? [printReportsRow] : []),
@@ -1262,10 +1282,15 @@ function refreshEntityListBody(ent) {
     }
     return el('tr', {}, [
       ...(hasPrintReports ? [el('td', {}, rowCheckbox)] : []),
-      ...visibleFields.map(f => el('td', {}, formatCell(f, row[f.name], ent, row))),
+      ...visibleFields.map(f => el('td', {}, renderListCell(f, row, ent))),
       el('td', {}, el('div', { class: 'row-actions' }, isAdmin() ? [
         el('button', { class: 'btn btn-outline btn-sm', onclick: () => openForm(ent, row) }, 'Edit'),
         el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteRow(ent, row) }, 'Delete'),
+        ...(ent.key === 'datatable' ? [el('button', {
+          class: 'btn btn-sm', style: 'background:#25D366;color:#fff;',
+          title: row.Mobile ? `Send WhatsApp to ${row.Mobile}` : 'No Mobile number saved',
+          onclick: () => sendWhatsAppToCandidate(row),
+        }, [el('i', { class: 'fa-brands fa-whatsapp' }), ' Send'])] : []),
       ] : [el('span', { style: 'color:var(--text-mute);font-size:.78rem;' }, '—')])),
     ]);
   }));
@@ -1321,6 +1346,74 @@ function buildPaginationBar(totalRows, current, totalPages, onPageChange) {
 }
 function pageBtn(p, current, onPageChange) {
   return el('button', { class: `btn btn-sm ${p === current ? 'btn-primary' : 'btn-outline'}`, onclick: () => onPageChange(p) }, String(p));
+}
+
+// Sends a candidate a WhatsApp message via a wa.me deep link — this opens
+// WhatsApp (the desktop app if installed, otherwise WhatsApp Web) with the
+// message already typed in; the person still clicks Send themselves inside
+// WhatsApp. That's a deliberate choice, not a limitation: a real "send
+// without you looking at it first" button would need either the WhatsApp
+// Business API (a paid, formally-approved account) or a separate always-on
+// automation tool — not something a plain web page can safely do on its
+// own, and not something that should silently fire without a human
+// checking the recipient/message first anyway.
+//
+// If the bridge extension is installed and an already-open WhatsApp Web
+// tab is found, this reuses that tab (via 're-whatsapp-send-request', a
+// content-app.js/background.js round trip — see the KSA/BEOE bridges
+// further down for the same pattern) instead of opening a new one every
+// time. Still opens a fresh tab as a fallback either way.
+const WHATSAPP_FIXED_MESSAGES = {
+  VISA_STAMPED: 'Your Visa has Stamped please send your account details and father or mother nic copy for protector bio metric',
+};
+function normalizeWhatsAppNumber(raw) {
+  let digits = String(raw || '').replace(/\D/g, '');
+  if (!digits) return null;
+  if (digits.startsWith('0')) digits = '92' + digits.slice(1);       // 03XX... -> 923XX...
+  else if (!digits.startsWith('92')) digits = '92' + digits;          // bare 3XX... -> 923XX...
+  return digits;
+}
+function sendWhatsAppToCandidate(row, messageKey = 'VISA_STAMPED') {
+  const number = normalizeWhatsAppNumber(row.Mobile);
+  if (!number) { toast('This candidate has no Mobile number saved.'); return; }
+  const text = encodeURIComponent(WHATSAPP_FIXED_MESSAGES[messageKey]);
+  const waMeUrl = `https://wa.me/${number}?text=${text}`;
+
+  // If the bridge extension is installed AND it finds an already-open,
+  // already-logged-in web.whatsapp.com tab, reuse that tab (just navigates
+  // it to the right chat, pre-filled) instead of opening a new one — same
+  // on-demand, ask-first pattern as the KSA/BEOE bridges: nothing sends
+  // itself, you still click Send inside WhatsApp yourself. No matching tab
+  // found, or the extension isn't installed at all? Falls straight back to
+  // the original wa.me new-tab behavior, unchanged.
+  if (document.body.getAttribute('data-re-whatsapp-bridge') === 'ready') {
+    const webUrl = `https://web.whatsapp.com/send?phone=${number}&text=${text}`;
+    const handler = (e) => {
+      document.removeEventListener('re-whatsapp-send-result', handler);
+      if (!(e.detail && e.detail.ok)) window.open(waMeUrl, '_blank', 'noopener');
+    };
+    document.addEventListener('re-whatsapp-send-result', handler);
+    document.dispatchEvent(new CustomEvent('re-whatsapp-send-request', { detail: { url: webUrl } }));
+    return;
+  }
+  window.open(waMeUrl, '_blank', 'noopener');
+}
+
+// Used by both list tables below (Search Candidates and the main entity
+// list) — everywhere except DATATABLE's own Name column, this is just
+// formatCell(). For that one column specifically, it's a clickable link
+// straight into the Edit form, so you don't need to hunt for the Edit
+// button in the row actions just to open a candidate.
+function renderListCell(f, row, ent) {
+  if (ent.key === 'datatable' && f.name === 'NAME') {
+    return el('a', {
+      href: '#',
+      style: 'color:#1a56db;text-decoration:underline;cursor:pointer;',
+      title: 'Click to open this candidate',
+      onclick: (e) => { e.preventDefault(); openForm(ent, row); },
+    }, String(row.NAME ?? '').trim() || '—');
+  }
+  return formatCell(f, row[f.name], ent, row);
 }
 
 function formatCell(field, value, ent, row) {
@@ -2324,6 +2417,18 @@ async function openForm(ent, existingRow) {
   const box = el('div', boxAttrs, [
     el('button', { class: 'modal-close', onclick: () => overlay.remove() }, '✕'),
     el('h3', {}, existingRow ? `Edit ${ent.label.replace(/s$/, '')}` : `Add ${ent.label.replace(/s$/, '')}`),
+    // Same WhatsApp send as the list's row action, just handy right at the
+    // top while you're already looking at this candidate's full record —
+    // no need to close back out to the list first. Only shown once a
+    // candidate actually exists to message (Edit, not a fresh Add), same
+    // as the list button using the saved row's Mobile.
+    ...(ent.key === 'datatable' && existingRow ? [
+      el('button', {
+        type: 'button', class: 'btn btn-outline btn-sm', style: 'margin-bottom:12px;',
+        title: existingRow.Mobile ? `Send WhatsApp to ${existingRow.Mobile}` : 'No Mobile number saved',
+        onclick: () => sendWhatsAppToCandidate(existingRow),
+      }, [el('i', { class: 'fa-brands fa-whatsapp' }), ' Send']),
+    ] : []),
     form,
   ]);
   overlay.appendChild(box);
@@ -2687,6 +2792,86 @@ function printLedgerReport(ent) {
 }
 
 /* ==========================================================================
+   FSA REFUND FORM — a batch list report ("Form of Refund of Service Charges"),
+   one row per candidate, driven by the Search Candidates page's existing
+   FSA Date From/To filter (see matchesFilters in renderSearchForm) rather
+   than a single candidate or a hand-ticked selection. Wording/columns match
+   the paper form exactly; only the table rows are dynamic.
+   ========================================================================== */
+function printFsaRefundForm(rows) {
+  if (!rows.length) { toast('No candidates match the current filters — adjust the FSA Date From/To (or other filters) and try again.'); return; }
+  const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const company = currentAgencyRow();
+  const agencyName = (company && company.AGENCYNAME) || '';
+  const licenceNo = (company && company.LICENCENUMBER) || '';
+
+  const bodyRows = rows.map((r, i) => {
+    const fsaCell = [esc(r.FSANo || ''), r.FSADate ? esc(formatDateDMY(r.FSADate)) : ''].filter(Boolean).join('<br>');
+    const flightDetail = [r.TRAVELBY, r.FLIGHT].filter(Boolean).map(esc).join(' ');
+    return `<tr>
+      <td>${i + 1}</td>
+      <td>${esc(r.NAME || '')}</td>
+      <td>${esc(r.FATHERSNAME || '')}</td>
+      <td>${esc(r.PASSPORTNO || '')}</td>
+      <td>${esc(r.PERMISSIONNO || '')}</td>
+      <td>${r.DATED ? esc(formatDateDMY(r.DATED)) : ''}</td>
+      <td>${fsaCell}</td>
+      <td>${esc(r.DESTINATION || '')}</td>
+      <td>${r.TRAVELDATE ? esc(formatDateDMY(r.TRAVELDATE)) : ''}</td>
+      <td>${flightDetail}</td>
+      <td>${esc(r['Ticket No'] || '')}</td>
+    </tr>`;
+  }).join('');
+
+  const html = `<!DOCTYPE html><html><head><title>FSA Refund Form</title>
+    <style>
+      @page { size: landscape; }
+      * { box-sizing: border-box; }
+      body { font-family: 'Times New Roman', Times, serif; padding: 30px 34px; color: #111; }
+      h1 { text-align: center; font-size: 17px; margin: 0 0 2px; }
+      h2 { text-align: center; font-size: 15px; margin: 0 0 20px; }
+      .promoter-row { display: flex; justify-content: space-between; margin-bottom: 14px; font-size: 13px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 20px; }
+      th, td { border: 1px solid #111; padding: 6px 8px; text-align: left; vertical-align: top; }
+      th { font-weight: bold; }
+      thead { display: table-header-group; } /* repeats the header row on every printed page */
+      tr { page-break-inside: avoid; }
+      h3 { font-size: 13px; margin: 18px 0 8px; }
+      p.cert { font-size: 12.5px; text-align: justify; margin: 0 0 14px; }
+      .note { font-size: 12px; margin: 0 0 4px; }
+      .sign { margin-top: 50px; text-align: right; font-weight: bold; font-size: 12.5px; }
+      @media print { body { padding: 16px 20px; } }
+    </style></head><body>
+    <h1>FORM OF REFUND OF SERVICE CHARGES Rs. <span style="border-bottom:1px solid #111;padding:0 60px;">&nbsp;</span></h1>
+    <h2>FROM EMIGRANTS WHO PROCEED ABROAD FOR EMPLOYMENT</h2>
+    <div class="promoter-row">
+      <div>Name of the Overseas Employment Promoters: <u>${esc(agencyName)}</u></div>
+      <div>LICENSE No. ${esc(licenceNo)}</div>
+    </div>
+    <table>
+      <thead><tr>
+        <th>SNO:</th><th>NAME</th><th>FATHERSNAME</th><th>PASSPORTNO</th><th>PERMISSION NO</th>
+        <th>DATED</th><th>Date FSA No</th><th>Destination</th><th>Date Of Departure</th>
+        <th>Airline Flight Detail</th><th>Ticket No</th>
+      </tr></thead>
+      <tbody>${bodyRows}</tbody>
+    </table>
+    <h3>CERTIFICATE FROM THE OVERSEAS EMPLOYMENT PROMOTER</h3>
+    <p class="cert">we herby certify that the above named Emigrants have left for employment abroad and have resumed duty on date specific above. we also undertake that if the above statement is found false, untrue or ncorrect, we are liable for disciplinary action.</p>
+    <div class="note">Note: 1. This form should be submitted in Duplicat</div>
+    <div class="note">2. Photo copy of certificate from Bank regarding deposit made to be enclosed</div>
+    <div class="sign">SIGNATURE AND SEAL OVERSEAS EMPLOYMENT PROMOTERS.</div>
+    </body></html>`;
+
+  const win = window.open('', '_blank');
+  win.document.write(html);
+  win.document.close();
+  const doPrint = () => { win.focus(); win.print(); };
+  if (win.document.readyState === 'complete') setTimeout(doPrint, 150);
+  else win.onload = () => setTimeout(doPrint, 150);
+}
+
+/* ==========================================================================
    REPORT DESIGNER (Candidates only, saved in THIS BROWSER only)
    A free-form drag-and-drop canvas: drop Candidate fields, plain text
    labels, and images anywhere on a page, save the layout, then print it for
@@ -2759,6 +2944,45 @@ async function renderReportsList() {
     ]),
   ]);
   content.appendChild(toolbar);
+
+  // A batch/list report (many rows, its own date filter) doesn't fit the
+  // Designer's per-candidate JSON template model above — nothing to
+  // "import" here, so it lives as its own self-contained block instead,
+  // with its own FSA Date From/To (independent of the Search Candidates
+  // page's filters — this always looks at every DATATABLE row for the
+  // current agency, not whatever Search Candidates happens to be showing).
+  const fsaFromInp = el('input', { type: 'text', placeholder: 'dd/mm/yyyy' });
+  const fsaToInp = el('input', { type: 'text', placeholder: 'dd/mm/yyyy' });
+  const fsaGenerateBtn = el('button', {
+    class: 'btn btn-primary',
+    onclick: async () => {
+      const dtEnt = entityByKey('datatable');
+      const { data, error } = await fetchAllRows(dtEnt.table, dtEnt.pk, dtEnt.agencyField);
+      if (error) { toast('Could not load DATATABLE: ' + error.message); return; }
+      const from = parseInputDMY(fsaFromInp.value);
+      const to = parseInputDMY(fsaToInp.value);
+      const rows = (data || []).filter(row => {
+        if (!from && !to) return true; // no range set — every row qualifies
+        const rowDate = parseStoredDate(row.FSADate);
+        if (!rowDate) return false; // can't confirm it falls in range, so don't guess
+        if (from && rowDate < from) return false;
+        if (to && rowDate > to) return false;
+        return true;
+      });
+      printFsaRefundForm(rows);
+    },
+  }, [el('i', { class: 'fa-solid fa-print' }), ' Generate']);
+
+  content.appendChild(el('div', { class: 'data-card', style: 'padding:16px;margin-bottom:20px;' }, [
+    el('h3', { style: 'margin:0 0 4px;font-size:1rem;' }, 'FSA Refund Form'),
+    el('div', { style: 'font-size:.82rem;color:var(--gray);margin-bottom:12px;' },
+      '"Form of Refund of Service Charges" — one row per candidate, for every DATATABLE record whose FSA Date falls in this range. Leave both blank to include every record.'),
+    el('div', { class: 'toolbar', style: 'flex-wrap:wrap;gap:16px;align-items:flex-end;margin-bottom:0;' }, [
+      el('div', { class: 'f-field' }, [el('label', {}, 'FSA Date From'), fsaFromInp]),
+      el('div', { class: 'f-field' }, [el('label', {}, 'FSA Date To'), fsaToInp]),
+      fsaGenerateBtn,
+    ]),
+  ]));
 
   if (!reports.length) {
     content.appendChild(el('div', { class: 'empty-state' },
@@ -3510,15 +3734,22 @@ function buildCandidatePage(report, candidate, esc, barcodeCounter) {
 // One row of report-print buttons. getSelectedRows() is called at click time
 // (not once up front) so it always reflects whatever's currently checked.
 // Shared by the Search Candidates page and the Employer list's print section.
-function buildReportButtonsRow(reports, getSelectedRows) {
-  if (!reports.length) return el('div', {});
+// extraButtons: pre-built <button> elements (styled the same way) appended
+// after the named-report ones — for actions that print candidates matching
+// the current filters rather than a hand-ticked selection (e.g. FSA Refund
+// Form), which don't fit the "one saved Designer report, ticked rows" shape
+// every entry in `reports` assumes.
+function buildReportButtonsRow(reports, getSelectedRows, extraButtons = []) {
+  if (!reports.length && !extraButtons.length) return el('div', {});
   // Deliberately NOT the shared .toolbar class here — that class carries its
   // own padding (for when it's used as the main toolbar container), which
-  // left visible space above/below this row no matter what margin was set
-  // on it. This is its own minimal wrapper instead, so the space between it
-  // and the search box above is only whatever's set right here.
-  return el('div', { style: 'display:flex;flex-wrap:wrap;gap:6px;padding:0;margin:6px 0 12px;' },
-    reports.map(r => el('button', {
+  // left visible space around this row no matter what margin was set on it.
+  // This is its own minimal wrapper instead. No margin of its own anymore —
+  // it now sits as one item in the same flex row as the search box and the
+  // other buttons, so that row's own gap handles the spacing; a margin here
+  // would just misalign it vertically against everything else in that row.
+  return el('div', { style: 'display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:0;margin:0;' }, [
+    ...reports.map(r => el('button', {
       class: 'btn btn-outline',
       // The shared .btn class applies its own margin for buttons used
       // standalone elsewhere in the app — overriding it inline (which
@@ -3526,8 +3757,9 @@ function buildReportButtonsRow(reports, getSelectedRows) {
       // is what keeps these tight against each other instead of spaced out.
       style: 'margin:0;',
       onclick: () => printReportForCandidates(r, getSelectedRows()),
-    }, [el('i', { class: 'fa-solid fa-print' }), ` ${r.name}`]))
-  );
+    }, [el('i', { class: 'fa-solid fa-print' }), ` ${r.name}`])),
+    ...extraButtons,
+  ]);
 }
 
 function printReportForCandidates(report, candidates) {
