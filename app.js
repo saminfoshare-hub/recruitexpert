@@ -1068,15 +1068,24 @@ function renderEntityList(ent) {
   if (ent.listFilter) {
     const refEnt = entityByKey(ent.listFilter.ref);
     const labelFn = CUSTOM_OPTION_LABELS[`${ent.key}.${ent.listFilter.field}`];
-    const options = [el('option', { value: '' }, `— All ${refEnt.label} —`)];
-    (cache[refEnt.table] || []).forEach(r => {
+    const optionList = (cache[refEnt.table] || []).map(r => {
       const label = labelFn ? labelFn(r) : (r[refEnt.displayField] ?? ('#' + r[refEnt.pk]));
-      options.push(el('option', { value: String(r[refEnt.pk]) }, String(label)));
+      return { value: String(r[refEnt.pk]), label: String(label) };
     });
-    const filterSelect = el('select', {
-      oninput: (e) => { listFilterValue = e.target.value; currentPage = 1; refreshEntityListBody(ent); },
-    }, options);
-    filterSelect.value = listFilterValue;
+    // Same searchable combo as DATATABLE's Category picker — the option
+    // labels here already include the employer's name and visa no (see
+    // CUSTOM_OPTION_LABELS['employerledger.EMPID'] above), so typing either
+    // one now brings matching employers to the top instead of only matching
+    // from the start of the name the way the old plain <select> did.
+    const combo = buildSearchableSelectField(optionList, listFilterValue, {
+      noneLabel: `— All ${refEnt.label} —`,
+      placeholder: `All ${refEnt.label} — type to search…`,
+    });
+    combo.hidden.addEventListener('change', () => {
+      listFilterValue = combo.hidden.value;
+      currentPage = 1;
+      refreshEntityListBody(ent);
+    });
     const dateFromInp = el('input', {
       type: 'text', placeholder: 'From dd/mm/yyyy', value: listDateFrom,
       oninput: (e) => { listDateFrom = e.target.value; currentPage = 1; refreshEntityListBody(ent); },
@@ -1085,10 +1094,29 @@ function renderEntityList(ent) {
       type: 'text', placeholder: 'To dd/mm/yyyy', value: listDateTo,
       oninput: (e) => { listDateTo = e.target.value; currentPage = 1; refreshEntityListBody(ent); },
     });
-    searchControl = el('div', { style: 'display:flex;flex-wrap:wrap;gap:10px;' }, [
-      el('div', { class: 'search-box' }, [el('i', { class: 'fa-solid fa-filter' }), filterSelect]),
-      el('div', { class: 'search-box' }, [el('i', { class: 'fa-solid fa-calendar' }), dateFromInp]),
-      el('div', { class: 'search-box' }, [el('i', { class: 'fa-solid fa-calendar' }), dateToInp]),
+    // Employer search on its own full-width row, the two date boxes
+    // together on the row below it — rather than all three competing for
+    // space on one row, which is what caused the earlier overlap.
+    searchControl = el('div', { style: 'display:flex;flex-direction:column;gap:10px;' }, [
+      // Fully inline-styled rather than leaning on .search-box's CSS: that
+      // class positions its icon absolutely, assuming a plain <input> right
+      // next to it with matching left-padding to clear it. Our combo is a
+      // nested div instead of a bare input, which didn't get that padding —
+      // the icon ended up floating on top of the typed text instead of
+      // beside it, with no visible border/background at all. These inline
+      // styles build the box (border, background, padding) and lay the icon
+      // out as a normal flex item instead, so it doesn't depend on that.
+      el('div', {
+        class: 'search-box',
+        style: 'width:100%;max-width:480px;position:relative;overflow:visible;display:flex;align-items:center;gap:10px;border:1px solid var(--border,#d7dce3);border-radius:8px;background:#fff;padding:9px 14px;',
+      }, [
+        el('i', { class: 'fa-solid fa-filter', style: 'position:static;flex:0 0 auto;color:var(--text-mute,#8a93a3);' }),
+        combo.wrap,
+      ]),
+      el('div', { style: 'display:flex;flex-wrap:wrap;gap:10px;' }, [
+        el('div', { class: 'search-box', style: 'flex:0 1 180px;max-width:200px;' }, [el('i', { class: 'fa-solid fa-calendar' }), dateFromInp]),
+        el('div', { class: 'search-box', style: 'flex:0 1 180px;max-width:200px;' }, [el('i', { class: 'fa-solid fa-calendar' }), dateToInp]),
+      ]),
     ]);
   } else {
     const searchLabel = ent.search
@@ -1589,6 +1617,135 @@ const CUSTOM_OPTION_LABELS = {
   },
 };
 
+// Searchable replacement for a plain <select> FK dropdown — used for
+// DATATABLE's Category picker (see below) because its option labels carry
+// more than just the category name (the linked employer's name, visa no,
+// demand — see CUSTOM_OPTION_LABELS above), and a native <select> only
+// jumps to options by matching the START of the visible text as you type.
+// That means typing an employer name or visa no (which sits later in the
+// label) never did anything. This renders a text input + a dropdown list
+// instead: typing filters/reorders the full option list so any option
+// whose label CONTAINS what was typed (anywhere — category, employer name,
+// or visa no) floats to the top, non-matches staying below in their
+// original order so the full list is still reachable by scrolling.
+//
+// Returns { hidden, wrap }: `hidden` is a plain <input type="hidden"> that
+// holds the actual selected value (e.g. CATEGORYID) and fires real 'change'
+// events on selection — a drop-in stand-in for the old <select> as far as
+// the rest of the form code (value reads, change listeners) is concerned.
+// `wrap` is the visible text input + dropdown, rendered alongside it.
+// opts.noneLabel / opts.placeholder let callers rename the "nothing picked"
+// option — e.g. the Employer Ledger filter below uses "— All Employers —"
+// instead of the form default "— none —", since there it means "don't
+// filter" rather than "this field is blank".
+function buildSearchableSelectField(optionList, currentValue, opts = {}) {
+  const noneLabel = opts.noneLabel || '— none —';
+  const placeholder = opts.placeholder || `${noneLabel} (type to search)`;
+
+  const hidden = el('input', { type: 'hidden' });
+  hidden.value = currentValue || '';
+
+  const byValue = new Map(optionList.map(o => [o.value, o]));
+  const initialLabel = currentValue && byValue.has(currentValue) ? byValue.get(currentValue).label : '';
+
+  // Inline-styled rather than relying on the surrounding .search-box CSS:
+  // this input sits one level deeper (inside `wrap`) than a plain search
+  // box's input does, so a `.search-box > input`-style rule wouldn't reach
+  // it. These make it blend in regardless of exactly how that class is
+  // written.
+  const textInput = el('input', {
+    type: 'text', autocomplete: 'off', placeholder,
+    style: 'border:none;outline:none;background:transparent;width:100%;font:inherit;color:inherit;padding:0;',
+  });
+  textInput.value = initialLabel;
+
+  // position:fixed and appended straight to <body> (not inside `wrap`) while
+  // open, rather than position:absolute nested inside the field — a nested
+  // absolute box only escapes an ancestor that clips overflow (a scrolling
+  // panel, a card with rounded corners, etc.) if every ancestor in between
+  // explicitly allows it, which is fragile and exactly the kind of thing
+  // that silently breaks a dropdown like this. Anchoring to <body> with
+  // coordinates read from the input's actual on-screen position sidesteps
+  // all of that, the same way a native <select>'s dropdown always draws on
+  // top no matter where it sits in the page.
+  const listBox = el('div', {
+    style: 'display:none;position:fixed;z-index:9999;background:var(--surface,#fff);border:1px solid var(--border,#ccc);max-height:240px;overflow:auto;box-shadow:0 4px 12px rgba(0,0,0,.18);border-radius:6px;',
+  });
+
+  const wrap = el('div', { style: 'position:relative;flex:1;display:flex;align-items:center;min-width:0;' }, [textInput]);
+
+  function positionList() {
+    const r = textInput.getBoundingClientRect();
+    listBox.style.left = Math.round(r.left) + 'px';
+    listBox.style.top = Math.round(r.bottom + 2) + 'px';
+    listBox.style.width = Math.round(r.width) + 'px';
+  }
+
+  function openList() {
+    if (!listBox.isConnected) document.body.appendChild(listBox);
+    positionList();
+    listBox.style.display = 'block';
+  }
+
+  function closeList() {
+    listBox.style.display = 'none';
+    if (listBox.isConnected) listBox.remove();
+  }
+
+  window.addEventListener('scroll', () => { if (listBox.style.display === 'block') positionList(); }, true);
+  window.addEventListener('resize', () => { if (listBox.style.display === 'block') positionList(); });
+
+  function selectOption(value, label) {
+    hidden.value = value;
+    textInput.value = label;
+    closeList();
+    hidden.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function renderList(query) {
+    const q = (query || '').trim().toLowerCase();
+    let items = optionList;
+    if (q) {
+      const matches = [];
+      const rest = [];
+      optionList.forEach(o => {
+        const idx = o.label.toLowerCase().indexOf(q);
+        if (idx !== -1) matches.push({ o, idx });
+        else rest.push(o);
+      });
+      matches.sort((a, b) => a.idx - b.idx || a.o.label.localeCompare(b.o.label));
+      items = [...matches.map(m => m.o), ...rest];
+    }
+    listBox.innerHTML = '';
+    const noneOpt = el('div', { style: 'padding:6px 10px;cursor:pointer;color:var(--text-mute);' }, noneLabel);
+    noneOpt.addEventListener('mousedown', (e) => { e.preventDefault(); selectOption('', ''); });
+    listBox.appendChild(noneOpt);
+    items.slice(0, 200).forEach(o => {
+      const row = el('div', { style: 'padding:6px 10px;cursor:pointer;' }, o.label);
+      row.addEventListener('mouseenter', () => { row.style.background = 'var(--primary-bg,#eef2ff)'; });
+      row.addEventListener('mouseleave', () => { row.style.background = ''; });
+      row.addEventListener('mousedown', (e) => { e.preventDefault(); selectOption(o.value, o.label); });
+      listBox.appendChild(row);
+    });
+  }
+
+  textInput.addEventListener('focus', () => { renderList(''); openList(); textInput.select(); });
+  textInput.addEventListener('input', () => { renderList(textInput.value); openList(); });
+  textInput.addEventListener('blur', () => {
+    // Small delay so a mousedown on an option (above) fires its selection
+    // before this runs — otherwise the blur would close the list first and
+    // the click would never land. If nothing matching was picked, the
+    // displayed text reverts to whatever is actually selected.
+    setTimeout(() => {
+      closeList();
+      const sel = byValue.get(hidden.value);
+      textInput.value = sel ? sel.label : '';
+    }, 150);
+  });
+
+  return { hidden, wrap };
+}
+
 // DATATABLE auto-fill: picking a Category pulls matching values from
 // CATEGORY, and — through CATEGORY.EMPID — from the linked EMPLOYER row.
 // Separately, three fields always mirror the logged-in agency's own
@@ -1791,6 +1948,7 @@ async function openForm(ent, existingRow) {
         refRows = [...refRows].sort((a, b) =>
           ((b.EMPID ?? 0) - (a.EMPID ?? 0)) || ((b.CATEGORYID ?? 0) - (a.CATEGORYID ?? 0)));
       }
+      const optionList = [];
       refRows.forEach(r => {
         // Don't offer an inactive employer as a choice — but if this record
         // is already pointing at one (e.g. it was set before the employer
@@ -1804,12 +1962,23 @@ async function openForm(ent, existingRow) {
         if (refEnt.key === 'agent' && r.CHECK !== true && String(r[refEnt.pk]) !== currentVal) return;
         const label = labelFn ? labelFn(r) : (r[refEnt.displayField] ?? ('#' + r[refEnt.pk]));
         options.push(el('option', { value: r[refEnt.pk] }, String(label)));
+        optionList.push({ value: String(r[refEnt.pk]), label: String(label) });
       });
-      inputEl = el('select', {}, options);
-      // Lock this record to the logged-in agency: pre-fill and disable so it
-      // can't be reassigned to a different agency while viewing this one.
-      inputEl.value = isAgencyField ? String(currentAgencyId ?? '') : (val ?? '');
-      if (isAgencyField) inputEl.disabled = true;
+      // DATATABLE's Category picker specifically: swap the plain <select>
+      // for a searchable one (see buildSearchableSelectField above) so
+      // typing an employer name or visa no — not just the category name —
+      // brings matching options to the top.
+      if (ent.key === 'datatable' && f.name === 'CATEGORYID') {
+        const combo = buildSearchableSelectField(optionList, currentVal);
+        inputEl = combo.hidden;
+        extraNode = combo.wrap;
+      } else {
+        inputEl = el('select', {}, options);
+        // Lock this record to the logged-in agency: pre-fill and disable so
+        // it can't be reassigned to a different agency while viewing this one.
+        inputEl.value = isAgencyField ? String(currentAgencyId ?? '') : (val ?? '');
+        if (isAgencyField) inputEl.disabled = true;
+      }
     } else if (f.type === 'dmydate') {
       // Still a plain text column underneath (formatDateDMY/parseStoredDate
       // elsewhere already read dd/mm/yyyy text fine) — this just actively
